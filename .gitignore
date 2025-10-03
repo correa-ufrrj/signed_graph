@@ -40,4 +40,5 @@ compile_commands.json
 /resultados_cluster_20250911/
 /scripts/results/
 /scripts/setup_gitignore.sh
+/scripts/switch_to_ssh_ubuntu.sh
 /scripts/*.csv
