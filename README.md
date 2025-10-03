@@ -22,6 +22,10 @@ This project provides a complete C++ implementation to compute the **frustration
 │   └── run_all_experiments.sh
 ```
 
+## Documentation
+
+- API & complexity notes: [docs/API-ANNOTATIONS.md](docs/API-ANNOTATIONS.md)
+
 ---
 
 ## 🧱 Build Instructions
