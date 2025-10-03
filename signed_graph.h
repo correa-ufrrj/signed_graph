@@ -95,9 +95,9 @@ public:
         int    triangle_cap_per_u = 2048;     // cap triangle pairs per u
 		const std::vector<double>* edge_salience = nullptr; // edge-aligned, in [0,1]
 		double kick_salience_bias = 0.5;                    // multiplier in [0,1]
-		bool   relax_to_all_pos_if_Z0_empty = false;        // DEFAULT: do NOT expand when Z0=∅ (fast path)
-		int    delta_m_minus_cap = 0;                       // allow only if Δm⁻ ≤ cap (0 = non-increasing)
-		double delta_m_minus_penalty = 2.0;                 // soft penalty if you don’t hard-gate
+		bool   relax_to_all_pos_if_Z0_empty = true;   // enable KICKs even if Z0=∅
+		int    delta_m_minus_cap = 512;               // allow modest M⁻ growth (bound Dijkstra)
+		double delta_m_minus_penalty = 0.0;           // no soft penalty (keep scoring cheap)
  };
 
 

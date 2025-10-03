@@ -674,14 +674,13 @@ void FrustrationModelXY::NegativeCycleCutGenerator::main(){ // compact signature
 			    /*use_weighted_degree*/     true,
 			    /*use_triangle_tiebreak*/   IS_ROOT,
 			    /*triangle_beta*/           0.05,
-		        /*neighbor_cap*/            IS_ROOT ? 768 : 256,   // cheaper scans off-root
-		        /*triangle_cap_per_u*/      IS_ROOT ? 1024 : 512
+		        /*neighbor_cap*/            IS_ROOT ? 512 : 256,   // cheaper scans off-root
+		        /*triangle_cap_per_u*/      IS_ROOT ? 768 : 384
 			};
-			CUTS_OPTS.edge_salience = &owner.graph.edge_salience_view();
-		    CUTS_OPTS.kick_salience_bias = 0.4;                   // lighter nudge (reduce drift)
-		    CUTS_OPTS.relax_to_all_pos_if_Z0_empty = IS_ROOT;     // only allow at root
-		    CUTS_OPTS.delta_m_minus_cap = 0;                      // forbid KICKs that increase M-
-		    CUTS_OPTS.delta_m_minus_penalty = 2.0;                // keep; used only if not hard-gated
+			CUTS_OPTS.kick_salience_bias = 0.5;                   // moderate nudge
+			CUTS_OPTS.relax_to_all_pos_if_Z0_empty = true;        // allow KICK even if Z0=∅
+			CUTS_OPTS.delta_m_minus_cap = std::max(256, (int)(0.008 * owner.graph.edge_count()));
+			CUTS_OPTS.delta_m_minus_penalty = 0.0;                // keep scoring tight
 			
 			owner.graph.restore_switched_sign();
 			auto s_opt = owner.graph.fractional_greedy_switching(CUTS_OPTS);

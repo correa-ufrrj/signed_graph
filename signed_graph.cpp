@@ -435,7 +435,7 @@ std::vector<int> SignedGraph::greedy_switching_base(const std::function<int(int,
 	            }
             }
 
-            if (!adj.empty()) {
+			if (!zero_nodes.empty() && !adj.empty()) {
                 std::vector<int> clique = find_max_clique(zero_nodes, adj);
                 if (!clique.empty()) {
                     u = clique.front();
@@ -464,122 +464,134 @@ std::vector<int> SignedGraph::greedy_switching_base(const std::function<int(int,
             if (opts.neg_edge_threshold_abs >= 0 && mminus > opts.neg_edge_threshold_abs) gate = true;
             if (opts.neg_edge_threshold_frac >= 0 && (double)mminus / (double)m > opts.neg_edge_threshold_frac) gate = true;
 
-            if (kicks_used < opts.max_kicks && gate) {
-				// Build Z0 (zero net-degree vertices)
-				std::vector<char> inZ0(n, 0);
-				int Z0count = 0;
-				for (int i = 0; i < n; ++i)
-				    if (d[i] == 0.0 && !std::signbit(d[i])) { inZ0[i] = 1; ++Z0count; }
-				
-				auto positive_weight = [&](int eid){
-				    double w = switched_weights[eid];
-				    return (w > 0.0) || (w == 0.0 && !std::signbit(w));
-				};
-				
-                // Default: if Z0 is empty and policy says "don’t relax", skip KICK altogether (fast path).
-                if (Z0count == 0 && !opts.relax_to_all_pos_if_Z0_empty) {
-                    break; // no KICK this round
-                }
-                const bool restrict_to_Z0 = (Z0count > 0);
-				
-				int best_u = -1; double best_score = 0.0; double best_aw = 0.0; int best_created = 0;
-				
-				igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-				for (int cand = 0; cand < n; ++cand) {
-				    igraph_incident(&g, &inc, cand, IGRAPH_ALL);
-				    int deg = (int)igraph_vector_int_size(&inc);
-				    int scan = std::min(deg, opts.neighbor_cap);
-				
-				    double Aw = 0.0; int created = 0;
-				    std::vector<int> posN; posN.reserve(scan);
-				
-                    // First pass: score using allowed neighbors (Z0 or all-positive when relaxed)
-				    for (int ii = 0; ii < scan; ++ii) {
-				        int eid = VECTOR(inc)[ii];
-				        if (!positive_weight(eid)) continue; // only positive neighbors pre-flip
-				        int v = IGRAPH_OTHER(&g, eid, cand);
-				        if (restrict_to_Z0 && !inZ0[v]) continue; // restrict to Z0 if requested
-				
-				        double w = switched_weights[eid];
-				        double sal = 0.0;
-				        if (opts.edge_salience && eid < (int)opts.edge_salience->size())
-				            sal = std::max(0.0, std::min(1.0, (*(opts.edge_salience))[eid]));
-				
-				        // salience-nudged contribution (stays ≥ 0, preserves weighting mode)
-				        double contrib = (opts.use_weighted_degree ? w : 1.0) * (1.0 + opts.kick_salience_bias * sal);
-				        Aw += contrib;
-				        ++created;
-				        posN.push_back(v);
-				    }
-                    if (Aw <= 0.0) continue;
-
-                    // Second pass (cheap): estimate Δm⁻ for flipping 'cand'
-                    int full_pos = 0, full_neg = 0;
-                    for (int ii = 0; ii < deg; ++ii) {
-                        int eid = VECTOR(inc)[ii];
-                        double w = switched_weights[eid];
-                        if ((w > 0.0) || (w == 0.0 && !std::signbit(w))) ++full_pos;
-                        else ++full_neg;
-                    }
-                    int delta_m_minus = full_pos - full_neg; // pos→neg minus neg→pos
-                    if (delta_m_minus > opts.delta_m_minus_cap) {
-                        // Hard gate: skip candidates that increase negatives too much (default cap = 0)
-                        continue;
-                    }
-				
-				    double score = Aw;
-                    // Optional soft penalty if you prefer not to hard-gate:
-                    if (opts.delta_m_minus_penalty > 0.0 && delta_m_minus > 0)
-                        score -= opts.delta_m_minus_penalty * (double)delta_m_minus;
-				
-				    if (opts.use_triangle_tiebreak && !posN.empty()) {
-				        int cap = opts.triangle_cap_per_u;
-				        int counted = 0, neg_pairs = 0;
-				        for (size_t i1 = 0; i1 < posN.size() && counted < cap; ++i1) {
-				            for (size_t i2 = i1 + 1; i2 < posN.size() && counted < cap; ++i2) {
-				                int v = posN[i1], wv = posN[i2];
-				                igraph_integer_t eid_vw;
-				                if (igraph_get_eid(&g, &eid_vw, v, wv, 0, 0) == IGRAPH_SUCCESS) {
-				                    double w = switched_weights[eid_vw];
-				                    if ((w < 0.0) || (w == 0.0 && std::signbit(w))) ++neg_pairs;
-				                }
-				                ++counted;
-				            }
-				        }
-				        score += opts.triangle_beta * (double)neg_pairs;
-				    }
-				
-				    if (score > best_score) {
-				        best_score = score; best_u = cand; best_aw = Aw; best_created = created;
-				    }
-				}
-				igraph_vector_int_destroy(&inc);
-
-                if (best_u != -1 && best_score > 0.0 /*kick applies*/) {
-                    single_switching(best_u, &incident);
-                    s[best_u] = 1 - s[best_u];
-                    d[best_u] = switched_d_plus[best_u] - switched_d_minus[best_u];
-                    for (int i = 0; i < igraph_vector_int_size(&incident); ++i) {
-                        int v = IGRAPH_OTHER(&g, VECTOR(incident)[i], best_u);
-                        d[v] = switched_d_plus[v] - switched_d_minus[v];
-                        if (in_heap.count(v)) pq.update(handles[v], v);
-                        else if (d[v] < 0.0 || (d[v] == 0.0 && std::signbit(d[v]))) {
-                            handles[v] = pq.push(v);
-                            in_heap.insert(v);
-                        }
-                    }
-                    ++kicks_used;
-                    created_neg_this_run += best_created;
-                    aw_sum_this_run += best_aw;
-                    std::cout << "[KICK] M-=" << mminus << "/" << m
-                              << ", |Z0|=" << Z0count
-                              << ", u*=" << best_u
-                              << ", Aw=" << best_aw
-                              << ", created=" << best_created
-                              << std::endl;
-                    continue; // resume greedy; fresh negatives likely exist
-                }
-            }
+			if (kicks_used < opts.max_kicks && gate) {
+			    // --- Build Z0 (zero net-degree vertices) ---
+			    std::vector<char> inZ0(n, 0);
+			    int Z0count = 0;
+			    for (int i = 0; i < n; ++i)
+			        if (d[i] == 0.0 && !std::signbit(d[i])) { inZ0[i] = 1; ++Z0count; }
+			
+			    auto positive_weight = [&](int eid){
+			        double w = switched_weights[eid];
+			        return (w > 0.0) || (w == 0.0 && !std::signbit(w));
+			    };
+			
+			    // Fast path: if Z0 is empty and the policy says “don’t relax”, don’t try KICK.
+			    if (Z0count == 0 && !opts.relax_to_all_pos_if_Z0_empty) {
+			        break; // exit the greedy loop as before
+			    }
+			    const bool restrict_to_Z0 = (Z0count > 0);  // if Z0 exists, keep the classic restriction
+			
+			    int best_u = -1; double best_score = 0.0; double best_aw = 0.0; int best_created = 0;
+			
+			    igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+			    for (int cand = 0; cand < n; ++cand) {
+			        igraph_incident(&g, &inc, cand, IGRAPH_ALL);
+			        const int deg  = (int)igraph_vector_int_size(&inc);
+			        const int scan = std::min(deg, opts.neighbor_cap);
+			
+			        // --- O(scan) estimate of Δm⁻ for flipping 'cand' (pos→neg minus neg→pos) ---
+			        // Sample the first 'scan' incident edges without any Z0 restriction.
+			        int sample_pos = 0, sample_neg = 0;
+			        for (int ii = 0; ii < scan; ++ii) {
+			            int eid = VECTOR(inc)[ii];
+			            double w = switched_weights[eid];
+			            if ((w > 0.0) || (w == 0.0 && !std::signbit(w))) ++sample_pos;
+			            else                                            ++sample_neg;
+			        }
+			        // Scale the sample to a conservative integer estimate of the full degree effect.
+			        // Using ceil() to be cautious; if scan==deg this equals the exact value.
+			        const double scale = (scan > 0 ? (double)deg / (double)scan : 1.0);
+			        const int delta_m_minus_est = (scan > 0)
+			                                    ? (int)std::ceil((sample_pos - sample_neg) * scale)
+			                                    : 0;
+			
+			        // Hard gate: skip vertices whose estimated Δm⁻ exceeds the cap.
+			        if (delta_m_minus_est > opts.delta_m_minus_cap) {
+			            continue;
+			        }
+			
+			        // --- First pass: score using allowed neighbors (Z0 or all-positive when relaxed) ---
+			        double Aw = 0.0; int created = 0;
+			        std::vector<int> posN; posN.reserve(scan);
+			
+			        for (int ii = 0; ii < scan; ++ii) {
+			            int eid = VECTOR(inc)[ii];
+			            if (!positive_weight(eid)) continue; // only positive neighbors pre-flip
+			            int v = IGRAPH_OTHER(&g, eid, cand);
+			            if (restrict_to_Z0 && !inZ0[v]) continue; // restrict to Z0 if requested
+			
+			            double w = switched_weights[eid];
+			            double sal = 0.0;
+			            if (opts.edge_salience && eid < (int)opts.edge_salience->size()) {
+			                sal = (*(opts.edge_salience))[eid];
+			                if      (sal < 0.0) sal = 0.0;
+			                else if (sal > 1.0) sal = 1.0;
+			            }
+			
+			            // salience-nudged contribution (nonnegative, preserves weighting mode)
+			            const double contrib = (opts.use_weighted_degree ? w : 1.0) * (1.0 + opts.kick_salience_bias * sal);
+			            Aw += contrib;
+			            ++created;
+			            posN.push_back(v);
+			        }
+			        if (Aw <= 0.0) continue;
+			
+			        double score = Aw;
+			
+			        // Optional soft penalty (kept for parity; you can set penalty=0 to skip)
+			        if (opts.delta_m_minus_penalty > 0.0 && delta_m_minus_est > 0)
+			            score -= opts.delta_m_minus_penalty * (double)delta_m_minus_est;
+			
+			        // Triangle tiebreak on the (already bounded) posN
+			        if (opts.use_triangle_tiebreak && !posN.empty()) {
+			            int cap = opts.triangle_cap_per_u;
+			            int counted = 0, neg_pairs = 0;
+			            for (size_t i1 = 0; i1 < posN.size() && counted < cap; ++i1) {
+			                for (size_t i2 = i1 + 1; i2 < posN.size() && counted < cap; ++i2) {
+			                    int v = posN[i1], wv = posN[i2];
+			                    igraph_integer_t eid_vw;
+			                    if (igraph_get_eid(&g, &eid_vw, v, wv, 0, 0) == IGRAPH_SUCCESS) {
+			                        double w = switched_weights[eid_vw];
+			                        if ((w < 0.0) || (w == 0.0 && std::signbit(w))) ++neg_pairs;
+			                    }
+			                    ++counted;
+			                }
+			            }
+			            score += opts.triangle_beta * (double)neg_pairs;
+			        }
+			
+			        if (score > best_score) {
+			            best_score = score; best_u = cand; best_aw = Aw; best_created = created;
+			        }
+			    }
+			    igraph_vector_int_destroy(&inc);
+			
+			    if (best_u != -1 && best_score > 0.0 /*kick applies*/) {
+			        single_switching(best_u, &incident);
+			        s[best_u] = 1 - s[best_u];
+			        d[best_u] = switched_d_plus[best_u] - switched_d_minus[best_u];
+			        for (int i = 0; i < igraph_vector_int_size(&incident); ++i) {
+			            int v = IGRAPH_OTHER(&g, VECTOR(incident)[i], best_u);
+			            d[v] = switched_d_plus[v] - switched_d_minus[v];
+			            if (in_heap.count(v)) pq.update(handles[v], v);
+			            else if (d[v] < 0.0 || (d[v] == 0.0 && std::signbit(d[v]))) {
+			                handles[v] = pq.push(v);
+			                in_heap.insert(v);
+			            }
+			        }
+			        ++kicks_used;
+			        created_neg_this_run += best_created;
+			        aw_sum_this_run += best_aw;
+			        std::cout << "[KICK] M-=" << mminus << "/" << m
+			                  << ", |Z0|=" << Z0count
+			                  << ", u*=" << best_u
+			                  << ", Aw=" << best_aw
+			                  << ", created=" << best_created
+			                  << std::endl;
+			        continue; // resume greedy; fresh negatives likely exist
+			    }
+			}
             break;
         }
 
