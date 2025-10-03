@@ -121,7 +121,7 @@ SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOpti
     };
 
     auto opts = opts_in; // copy, then augment
-    opts.edge_salience      = &salience_full_;
+	opts.edge_salience = &edge_salience_view();   // uses salience_full_ if set, else mask_weights
     opts.kick_salience_bias = 0.5;       // or expose as parameter / heuristic
 
     auto s = greedy_switching_base(cmp_fn, opts);
