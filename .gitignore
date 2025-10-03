@@ -1,18 +1,43 @@
-# .gitignore
+# builds & cmake junk
+/build*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+compile_commands.json
+*.cmake
+
+# objects & bins
 /.venv
 /node_modules
 /dist
 /build
-/.DS_Store
-/.idea
-/.vscode
-/data/
-/tmp/
 /Debug/
-/logs/
 /Release/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# IDEs
+.idea/
+.vscode/
+*.code-workspace
+
+# logs & temps
+/logs/
+/scripts/logs/
+*.log
+*.tmp
+
+# datasets (keep a small sample instead)
 /resultados/
 /resultados_cluster_20250911/
 /scripts/results/
-/scripts/logs/
+/scripts/setup_gitignore.sh
 /scripts/*.csv
