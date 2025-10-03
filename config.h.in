@@ -1,0 +1,2 @@
+#define article_borneinf_VERSION_MAJOR @article_borneinf_VERSION_MAJOR@
+#define article_borneinf_VERSION_MINOR @article_borneinf_VERSION_MINOR@

@@ -1,0 +1,18 @@
+# .gitignore
+/.venv
+/node_modules
+/dist
+/build
+/.DS_Store
+/.idea
+/.vscode
+/data/
+/tmp/
+/Debug/
+/logs/
+/Release/
+/resultados/
+/resultados_cluster_20250911/
+/scripts/results/
+/scripts/logs/
+/scripts/*.csv
