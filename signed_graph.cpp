@@ -6,9 +6,15 @@
 #include <boost/heap/pairing_heap.hpp>
 #include <ostream>
 
-std::ostream& operator<<(std::ostream& os, const Edge& e) {
-    os << "(" << e.first << ", " << e.second << ")";
-    return os;
+namespace {
+inline int sign_of(double w) {
+    return (w >= 0.0 && !(w == 0.0 && std::signbit(w))) ? +1 : -1;
+}
+}
+
+inline int sign_of(double w) {
+    // Positive if w > 0 OR w is +0.0; negative if w < 0 OR w is -0.0.
+    return (w >= 0.0 && !(w == 0.0 && std::signbit(w))) ? +1 : -1;
 }
 
 SignedEdge SignedGraph::SignedEdgesView::operator[](igraph_integer_t eid) const {
@@ -253,7 +259,7 @@ std::vector<int> SignedGraph::maximal_salience_clique_strict_pos(
         bool ok = true;
         for (int v : Q) {
             igraph_integer_t eid;
-            if (igraph_get_eid(const_cast<igraph_t*>(&g_), &eid, u, v, /*directed=*/0, /*error=*/0) != IGRAPH_SUCCESS) {
+            if (igraph_get_eid(const_cast<igraph_t*>(&g), &eid, u, v, /*directed=*/0, /*error=*/0) != IGRAPH_SUCCESS) {
                 ok = false; break;
             }
             double w = switched_frac_edge_sign[(int)eid];
@@ -279,7 +285,7 @@ int SignedGraph::pick_u_star_in_Q(
     int best_u = -1;
 
     for (int u : Q) {
-        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        igraph_incident(const_cast<igraph_t*>(&g), &inc, u, IGRAPH_ALL);
         double score = 0.0;
         for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
             int eid = VECTOR(inc)[ii];
@@ -307,11 +313,14 @@ void SignedGraph::integer_projection_from_x(
         s_int[u] = 1 - 2 * xu; // in {-1,+1}
     }
     // sigma_int(uv) = s_int[u] * sigma_s(uv) * s_int[v]
-    sigma_int_edge_sign.resize(m_); // m_ is edge count
-    for (int eid = 0; eid < m_; ++eid) {
-        int u = edges_[eid].first, v = edges_[eid].second;
-        double sig = (double)signature_[eid]; // \sigma_s, assume {-1,+1}
-        sigma_int_edge_sign[eid] = (double)s_int[u] * sig * (double)s_int[v];
+    sigma_int_edge_sign.resize(igraph_ecount(&g)); // igraph_ecount(&g) is edge count
+    for (int eid = 0; eid < igraph_ecount(&g); ++eid) {
+		igraph_integer_t from, to;
+		igraph_edge(&g, eid, &from, &to);
+		int u = static_cast<int>(from), v = static_cast<int>(to);
+		// σ_int(uv) = s_int[u] * σ_s(uv) * s_int[v], where σ_s comes from the current working signature:
+		int sgn_s = sign_of(switched_weights[eid]);
+		sigma_int_edge_sign[eid] = static_cast<double>(s_int[u] * sgn_s * s_int[v]);
     }
 }
 
@@ -326,7 +335,7 @@ void SignedGraph::integer_greedy_pass_minheap(
     // Compute integer net degree d_u = sum_{v} sigma_int(uv)
     igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
     for (int u = 0; u < n; ++u) {
-        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        igraph_incident(const_cast<igraph_t*>(&g), &inc, u, IGRAPH_ALL);
         int sum = 0;
         for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
             int eid = VECTOR(inc)[ii];
@@ -352,12 +361,12 @@ void SignedGraph::integer_greedy_pass_minheap(
         s_int[u] = -s_int[u];
 
         // update incident edges & neighbor degrees
-        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        igraph_incident(const_cast<igraph_t*>(&g), &inc, u, IGRAPH_ALL);
         d_int[u] = -d_int[u]; // flipping u flips the sign of all incident terms
 
         for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
             int eid = VECTOR(inc)[ii];
-            int v = IGRAPH_OTHER(const_cast<igraph_t*>(&g_), eid, u);
+            int v = IGRAPH_OTHER(const_cast<igraph_t*>(&g), eid, u);
 
             // sigma_int(uv) flips sign
             sigma_int_edge_sign[eid] = -sigma_int_edge_sign[eid];
@@ -517,8 +526,8 @@ std::vector<int> SignedGraph::greedy_switching_base(
     const std::function<int(int,int)>& cmp_fn,
     const GreedyKickOptions& opts)
 {
-    const int n = n_;
-    const int m = m_;
+    const int n = vertex_count();
+    const int m = igraph_ecount(&g);
 
     // --- Working switching s (start at +1) ---
     std::vector<int> s(n, 1);
@@ -527,8 +536,8 @@ std::vector<int> SignedGraph::greedy_switching_base(
     // --- Edge signs under current switching: sigma_s(uv) in {-1,+1} ---
     std::vector<double> sigma_s_edge_sign(m, 1.0);
     for (int eid = 0; eid < m; ++eid) {
-        int u = edges_[eid].first, v = edges_[eid].second;
-        sigma_s_edge_sign[eid] = (double)s[u] * (double)signature_[eid] * (double)s[v];
+		double w = switched_weights[eid];
+		sigma_s_edge_sign[eid] = static_cast<double>( sign_of(w) );
     }
 
     // --- Fractional surrogate per-edge: \tilde\sigma = sigma_s * tau(x) ---
@@ -544,7 +553,9 @@ std::vector<int> SignedGraph::greedy_switching_base(
             return;
         }
         for (int eid = 0; eid < m; ++eid) {
-            int u = edges_[eid].first, v = edges_[eid].second;
+			igraph_integer_t from, to;
+			igraph_edge(&g, eid, &from, &to);
+			int u = static_cast<int>(from), v = static_cast<int>(to);
             double tau = tau_from_x((*X)[u], (*X)[v]); // product surrogate
             // signed zeros honored naturally via IEEE if tau==0
             tilde_sigma[eid] = sigma_s_edge_sign[eid] * tau;
@@ -557,7 +568,7 @@ std::vector<int> SignedGraph::greedy_switching_base(
         std::fill(dtilde.begin(), dtilde.end(), 0.0);
         igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
         for (int u = 0; u < n; ++u) {
-            igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+            igraph_incident(&g, &inc, u, IGRAPH_ALL);
             double sum = 0.0;
             for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
                 int eid = VECTOR(inc)[ii];
@@ -579,7 +590,7 @@ std::vector<int> SignedGraph::greedy_switching_base(
     auto flip_working = [&](int u){
         s[u] = -s[u];
         igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-        igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+        igraph_incident(&g, &inc, u, IGRAPH_ALL);
         for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
             int eid = VECTOR(inc)[ii];
             sigma_s_edge_sign[eid] = -sigma_s_edge_sign[eid];
@@ -622,13 +633,13 @@ std::vector<int> SignedGraph::greedy_switching_base(
 
                 // update dtilde locally
                 igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-                igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+                igraph_incident(&g, &inc, u, IGRAPH_ALL);
 
                 // flipping u flips the sign of all incident edge contributions
                 dtilde[u] = -dtilde[u];
                 for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
                     int eid = VECTOR(inc)[ii];
-                    int v = IGRAPH_OTHER(&g_, eid, u);
+                    int v = IGRAPH_OTHER(&g, eid, u);
                     // For neighbor v, its incident sum changes by +/-2*tilde contribution of that eid before flip.
                     // But since we don't store the old per-edge, a safe route: recompute v's dtilde incrementally by:
                     // dtilde[v] += (-tilde_old_eid - tilde_old_eid) = -2 * tilde_old_eid.
@@ -636,7 +647,7 @@ std::vector<int> SignedGraph::greedy_switching_base(
                     // To stay simple & robust, rebuild only neighbors:
                     double sumv = 0.0;
                     igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
-                    igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                    igraph_incident(&g, &incv, v, IGRAPH_ALL);
                     for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) {
                         int e2 = VECTOR(incv)[jj];
                         sumv += tilde_sigma[e2];
@@ -679,14 +690,14 @@ std::vector<int> SignedGraph::greedy_switching_base(
 
                         // recompute dtilde only at ustar neighbors (simple & safe: rebuild neighbors)
                         igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-                        igraph_incident(&g_, &inc, ustar, IGRAPH_ALL);
+                        igraph_incident(&g, &inc, ustar, IGRAPH_ALL);
                         dtilde[ustar] = -dtilde[ustar];
                         for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
                             int eid = VECTOR(inc)[ii];
-                            int v = IGRAPH_OTHER(&g_, eid, ustar);
+                            int v = IGRAPH_OTHER(&g, eid, ustar);
                             double sumv = 0.0;
                             igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
-                            igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                            igraph_incident(&g, &incv, v, IGRAPH_ALL);
                             for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) sumv += tilde_sigma[VECTOR(incv)[jj]];
                             dtilde[v] = sumv;
                             igraph_vector_int_destroy(&incv);
@@ -746,7 +757,7 @@ std::vector<int> SignedGraph::greedy_switching_base(
                 // deg(u) = (#pos incident - #neg incident) under sigma_s
                 int deg_u = 0;
                 igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-                igraph_incident(&g_, &inc, ustar, IGRAPH_ALL);
+                igraph_incident(&g, &inc, ustar, IGRAPH_ALL);
                 for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
                     int eid = VECTOR(inc)[ii];
                     if (sigma_s_edge_sign[eid] > 0.0) ++deg_u; else --deg_u;
@@ -768,14 +779,14 @@ std::vector<int> SignedGraph::greedy_switching_base(
                 // reuse the logic from integer_greedy_pass_minheap for a single vertex.
                 {
                     igraph_vector_int_t inc2; igraph_vector_int_init(&inc2, 0);
-                    igraph_incident(&g_, &inc2, ustar, IGRAPH_ALL);
+                    igraph_incident(&g, &inc2, ustar, IGRAPH_ALL);
                     // flip s_int
                     s_int[ustar] = -s_int[ustar];
                     // degree update at ustar
                     d_int[ustar] = -d_int[ustar];
                     for (int ii = 0; ii < (int)igraph_vector_int_size(&inc2); ++ii) {
                         int eid = VECTOR(inc2)[ii];
-                        int v = IGRAPH_OTHER(&g_, eid, ustar);
+                        int v = IGRAPH_OTHER(&g, eid, ustar);
                         double &sig = sigma_int_edge_sign[eid];
                         double old = sig;
                         sig = -sig; // flip
@@ -793,14 +804,14 @@ std::vector<int> SignedGraph::greedy_switching_base(
 
                 // Refresh dtilde for u and neighbors (local rebuild)
                 igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-                igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+                igraph_incident(&g, &inc, u, IGRAPH_ALL);
                 dtilde[u] = -dtilde[u];
                 for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
                     int eid = VECTOR(inc)[ii];
-                    int v = IGRAPH_OTHER(&g_, eid, u);
+                    int v = IGRAPH_OTHER(&g, eid, u);
                     double sumv = 0.0;
                     igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
-                    igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                    igraph_incident(&g, &incv, v, IGRAPH_ALL);
                     for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) sumv += tilde_sigma[VECTOR(incv)[jj]];
                     dtilde[v] = sumv;
                     igraph_vector_int_destroy(&incv);
