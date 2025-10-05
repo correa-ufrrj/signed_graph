@@ -206,24 +206,24 @@ void SignedGraph::compute_degrees() {
 }
 
 // --- Signed zeros on edges (already used style: rely on +0/-0 via signbit) ---
-inline static bool SignedGraph::strictly_positive(double w) { return w > 0.0; }
+inline bool SignedGraph::strictly_positive(double w) { return w > 0.0; }
 
 // Vertex salience from x (peaks at 0.5)
-inline static double SignedGraph::vertex_salience(double x) {
+inline double SignedGraph::vertex_salience(double x) {
     double a = std::fabs(x - 0.5) * 2.0;
     if (a > 1.0) a = 1.0;
     return 1.0 - a; // in [0,1]
 }
 
 // Edge salience from y (if provided); otherwise 0.
-inline static double SignedGraph::edge_salience_from_y(double y) {
+inline double SignedGraph::edge_salience_from_y(double y) {
     double a = std::fabs(y - 0.5) * 2.0;
     if (a > 1.0) a = 1.0;
     return 1.0 - a; // in [0,1]
 }
 
 // Compute product-surrogate tau = 4 x_u x_v - 2 x_u - 2 x_v + 1
-inline static double SignedGraph::tau_from_x(double xu, double xv) {
+inline double SignedGraph::tau_from_x(double xu, double xv) {
     return 4.0 * xu * xv - 2.0 * xu - 2.0 * xv + 1.0;
 }
 
