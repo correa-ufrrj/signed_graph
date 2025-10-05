@@ -77,37 +77,29 @@ bool SignedGraphForMIP::weighting_from_fractional(const std::vector<double>& x,
     return has_changed;
 }
 
-const std::vector<int> SignedGraphForMIP::greedy_switching()
-{
-    SignedGraph::GreedyKickOptions opts;
-    std::vector<double> X1(this->n(), 1.0);
-	// pure integer greedy: leave opts.frac_x/frac_y as nullptr
+const std::vector<int> SignedGraphForMIP::greedy_switching() {
+    SignedGraph::GreedyKickOptions opts;  // pure integer greedy: no fractional guidance
     return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts);
 }
 
 // ---- fractional_greedy_switching overloads (SignedGraphForMIP) ----
-// Note: if these definitions already exist elsewhere, keep only one definition.
-// They route the fractional weighting priority into the greedy with kick options.
-// signed_graph_mip.cpp (or wherever the MIP glue lives)
 std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts)
-{
-    SignedGraph::GreedyKickOptions opts = user_opts;
-    // If you have LP vectors available at this call site, assign them here:
-    // opts.frac_x = &lp_x;  // e.g., vectors pulled from your MIP callback
-    // opts.frac_y = &lp_y;  // optional (only used for salience)
-    // Otherwise leave them nullptr; the heuristic will still run (uniform τ/salience).
-
-    // IMPORTANT: do not build tau from y; the graph’s greedy_switching_base uses product surrogate from x
-    // Salience: if you have an internal edge_salience_view() from y, keep it; otherwise pass frac_y to score edges.
-
-    return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts)
+SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts) {
+    SignedGraph::GreedyKickOptions opts = user_opts; // local copy
+    // If you have LP vectors here, set:
+    //   opts.frac_x = &lp_x;
+    //   opts.frac_y = &lp_y;  // optional
+    auto sp = std::make_shared<const std::vector<int>>(
+        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
+    return sp;
 }
 
-// Backwards-compatible overload
 std::optional<std::shared_ptr<const std::vector<int>>>
 SignedGraphForMIP::fractional_greedy_switching() {
-    return fractional_greedy_switching(SignedGraph::GreedyKickOptions{});
+    SignedGraph::GreedyKickOptions opts;
+    auto sp = std::make_shared<const std::vector<int>>(
+        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
+    return sp;
 }
 
 // --- SignedGraphForMIP wrappers over the stream ---
