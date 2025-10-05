@@ -12,11 +12,6 @@ inline int sign_of(double w) {
 }
 }
 
-inline int sign_of(double w) {
-    // Positive if w > 0 OR w is +0.0; negative if w < 0 OR w is -0.0.
-    return (w >= 0.0 && !(w == 0.0 && std::signbit(w))) ? +1 : -1;
-}
-
 SignedEdge SignedGraph::SignedEdgesView::operator[](igraph_integer_t eid) const {
     double w = (*weights)[eid];
     int sign = (w == 0.0 && std::signbit(w)) ? -1 : (w >= 0.0 ? 1 : -1);
