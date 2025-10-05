@@ -77,57 +77,35 @@ bool SignedGraphForMIP::weighting_from_fractional(const std::vector<double>& x,
     return has_changed;
 }
 
-const std::vector<int> SignedGraphForMIP::greedy_switching() {
-    auto trivial_cmp = [](int, int) { return 0; };
-    auto s = greedy_switching_base(trivial_cmp);
+const std::vector<int> SignedGraphForMIP::greedy_switching()
+{
+    SignedGraph::GreedyKickOptions opts;
+    std::vector<double> X1(graph_.n(), 1.0);
+    opts.frac_x = &X1;  // product surrogate = 1 => integer behavior
+    // leave frac_y null
 
-    // Copy "switched_weights" → "frac_weights"
-    std::transform(switched_weights.begin(), switched_weights.end(), frac_weights.begin(),
-                   [](double val) { return static_cast<double>(val); });
-	std::cout << "[SignedGraph] greedy_switching finished." << std::endl;
-
+    auto s = graph_.greedy_switching_base(/*cmp_fn=*/nullptr, opts);
     return s;
 }
 
 // ---- fractional_greedy_switching overloads (SignedGraphForMIP) ----
 // Note: if these definitions already exist elsewhere, keep only one definition.
 // They route the fractional weighting priority into the greedy with kick options.
-
+// signed_graph_mip.cpp (or wherever the MIP glue lives)
 std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& opts_in) {
-    int n = igraph_vcount(&g);
-    std::vector<double> w_plus(n, 0.0), w_minus(n, 0.0);
+SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts)
+{
+    SignedGraph::GreedyKickOptions opts = user_opts;
+    opts.frac_x = &this->frac_x_;  // store x from LP
+    opts.frac_y = &this->frac_y_;  // optional, only for salience
 
-    for (igraph_integer_t eid = 0; eid < igraph_ecount(&g); ++eid) {
-        igraph_integer_t u, v;
-        igraph_edge(&g, eid, &u, &v);
-        double weight = 1 - frac_weights[eid];
-        if (weight >= 0) {
-            w_plus[u] += weight;
-            w_plus[v] += weight;
-        } else {
-            w_minus[u] += -weight;
-            w_minus[v] += -weight;
-        }
-    }
+    // IMPORTANT: do not build tau from y; the graph’s greedy_switching_base uses product surrogate from x
+    // Salience: if you have an internal edge_salience_view() from y, keep it; otherwise pass frac_y to score edges.
 
-    std::vector<double> w(n);
-    std::transform(w_plus.begin(), w_plus.end(), w_minus.begin(), w.begin(), std::minus<double>());
-
-    auto cmp_fn = [&](int a, int b) -> int {
-        if (w[a] > w[b]) return 1;
-        if (w[a] < w[b]) return -1;
-        return 0;
-    };
-
-    auto opts = opts_in; // copy, then augment
-	opts.edge_salience = &edge_salience_view();   // uses salience_full_ if set, else mask_weights
-    opts.kick_salience_bias = 0.5;       // or expose as parameter / heuristic
-
-    auto s = greedy_switching_base(cmp_fn, opts);
-    if (std::all_of(s.begin(), s.end(), [](int v){ return v == 0; }))
-        return std::nullopt;
-    return std::make_shared<const std::vector<int>>(std::move(s));
+    auto s_vec = std::make_shared<std::vector<int>>(
+        graph_.greedy_switching_base(/*cmp_fn=*/nullptr, opts)
+    );
+    return s_vec;
 }
 
 // Backwards-compatible overload

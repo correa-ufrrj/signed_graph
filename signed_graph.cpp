@@ -205,6 +205,178 @@ void SignedGraph::compute_degrees() {
     }
 }
 
+// --- Signed zeros on edges (already used style: rely on +0/-0 via signbit) ---
+inline static bool SignedGraph::strictly_positive(double w) { return w > 0.0; }
+
+// Vertex salience from x (peaks at 0.5)
+inline static double SignedGraph::vertex_salience(double x) {
+    double a = std::fabs(x - 0.5) * 2.0;
+    if (a > 1.0) a = 1.0;
+    return 1.0 - a; // in [0,1]
+}
+
+// Edge salience from y (if provided); otherwise 0.
+inline static double SignedGraph::edge_salience_from_y(double y) {
+    double a = std::fabs(y - 0.5) * 2.0;
+    if (a > 1.0) a = 1.0;
+    return 1.0 - a; // in [0,1]
+}
+
+// Compute product-surrogate tau = 4 x_u x_v - 2 x_u - 2 x_v + 1
+inline static double SignedGraph::tau_from_x(double xu, double xv) {
+    return 4.0 * xu * xv - 2.0 * xu - 2.0 * xv + 1.0;
+}
+
+// Build a maximal clique Q inside Z0 on strictly-positive edges,
+// greedily by vertex salience. Returns list of vertex ids (may be empty).
+std::vector<int> SignedGraph::maximal_salience_clique_strict_pos(
+    const std::vector<int>& z0_vertices,
+    const std::vector<char>& inZ0,
+    const std::vector<double>& switched_frac_edge_sign, // \widetilde\sigma on edges (signed zeros allowed)
+    const std::vector<double>* frac_x // for vertex salience
+) const {
+    const int n = (int)inZ0.size();
+    std::vector<int> cand = z0_vertices;
+    // Order candidates by descending vertex salience
+    std::sort(cand.begin(), cand.end(), [&](int a, int b){
+        double sa = frac_x ? vertex_salience((*frac_x)[a]) : 0.0;
+        double sb = frac_x ? vertex_salience((*frac_x)[b]) : 0.0;
+        if (sa != sb) return sa > sb;
+        return a < b;
+    });
+
+    std::vector<int> Q;
+    Q.reserve(cand.size());
+
+    // (Simple maximal clique by greedy grow)
+    for (int u : cand) {
+        bool ok = true;
+        for (int v : Q) {
+            igraph_integer_t eid;
+            if (igraph_get_eid(const_cast<igraph_t*>(&g_), &eid, u, v, /*directed=*/0, /*error=*/0) != IGRAPH_SUCCESS) {
+                ok = false; break;
+            }
+            double w = switched_frac_edge_sign[(int)eid];
+            if (!strictly_positive(w)) { ok = false; break; } // STRICT > 0, no +0 allowed
+        }
+        if (ok) Q.push_back(u);
+    }
+
+    // Ensure |Q| >= 2, otherwise empty
+    if ((int)Q.size() < 2) Q.clear();
+    return Q;
+}
+
+int SignedGraph::pick_u_star_in_Q(
+    const std::vector<int>& Q,
+    const std::vector<double>& switched_frac_edge_sign,
+    const std::vector<double>* frac_y // edge salience source
+) const {
+    if (Q.empty()) return -1;
+
+    igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+    double best_score = -1.0;
+    int best_u = -1;
+
+    for (int u : Q) {
+        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        double score = 0.0;
+        for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+            int eid = VECTOR(inc)[ii];
+            double w = switched_frac_edge_sign[eid];
+            if (!strictly_positive(w)) continue; // STRICT
+            if (frac_y) {
+                score += edge_salience_from_y((*frac_y)[eid]);
+            }
+        }
+        if (score > best_score) { best_score = score; best_u = u; }
+    }
+    igraph_vector_int_destroy(&inc);
+    return best_u;
+}
+
+void SignedGraph::integer_projection_from_x(
+    const std::vector<double>& x,
+    std::vector<int>& s_int,           // out: s_int[u] = 1 - 2*round(x_u>=0.5)
+    std::vector<double>& sigma_int_edge_sign // out: +1 / -1 on edges after switching by s_int
+) const {
+    const int n = (int)x.size();
+    s_int.assign(n, 1);
+    for (int u = 0; u < n; ++u) {
+        int xu = (x[u] >= 0.5) ? 1 : 0;
+        s_int[u] = 1 - 2 * xu; // in {-1,+1}
+    }
+    // sigma_int(uv) = s_int[u] * sigma_s(uv) * s_int[v]
+    sigma_int_edge_sign.resize(m_); // m_ is edge count
+    for (int eid = 0; eid < m_; ++eid) {
+        int u = edges_[eid].first, v = edges_[eid].second;
+        double sig = (double)signature_[eid]; // \sigma_s, assume {-1,+1}
+        sigma_int_edge_sign[eid] = (double)s_int[u] * sig * (double)s_int[v];
+    }
+}
+
+void SignedGraph::integer_greedy_pass_minheap(
+    std::vector<double>& sigma_int_edge_sign, // +1/-1
+    std::vector<int>& s_int,                  // flips update this
+    std::vector<int>& d_int                   // out: integer net degree per vertex
+) const {
+    const int n = (int)s_int.size();
+    d_int.assign(n, 0);
+
+    // Compute integer net degree d_u = sum_{v} sigma_int(uv)
+    igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+    for (int u = 0; u < n; ++u) {
+        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        int sum = 0;
+        for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+            int eid = VECTOR(inc)[ii];
+            sum += (sigma_int_edge_sign[eid] > 0.0) ? 1 : -1;
+        }
+        d_int[u] = sum;
+    }
+
+    // min-heap by d_int[u]
+    struct Node { int u; int key; };
+    auto cmp = [](const Node& a, const Node& b){ return a.key > b.key; };
+    std::priority_queue<Node,std::vector<Node>,decltype(cmp)> pq(cmp);
+    for (int u = 0; u < n; ++u) pq.push({u, d_int[u]});
+
+    // Greedy flips while min key < 0
+    while (!pq.empty() && pq.top().key < 0) {
+        int u = pq.top().u; pq.pop();
+
+        // Revalidate (lazy heap)
+        if (d_int[u] >= 0) continue;
+
+        // Flip u in integer view
+        s_int[u] = -s_int[u];
+
+        // update incident edges & neighbor degrees
+        igraph_incident(const_cast<igraph_t*>(&g_), &inc, u, IGRAPH_ALL);
+        d_int[u] = -d_int[u]; // flipping u flips the sign of all incident terms
+
+        for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+            int eid = VECTOR(inc)[ii];
+            int v = IGRAPH_OTHER(const_cast<igraph_t*>(&g_), eid, u);
+
+            // sigma_int(uv) flips sign
+            sigma_int_edge_sign[eid] = -sigma_int_edge_sign[eid];
+
+            // Update neighbor degree: one incident term flipped; adjust +/-2 accordingly
+            if (sigma_int_edge_sign[eid] > 0.0) {
+                // became +1, neighbor gains +2 (from -1 to +1)
+                d_int[v] += 2;
+            } else {
+                // became -1, neighbor loses 2 (from +1 to -1)
+                d_int[v] -= 2;
+            }
+            pq.push({v, d_int[v]});
+        }
+        pq.push({u, d_int[u]});
+    }
+    igraph_vector_int_destroy(&inc);
+}
+
 const SignedGraph::EdgeIndexesView SignedGraph::edge_index() const {
     return SignedGraph::EdgeIndexesView{_edge_index, &g};
 }
@@ -340,305 +512,327 @@ void SignedGraph::restore_switched_sign() {
     switched_d_minus = d_minus;
 }
 
-std::vector<int> SignedGraph::greedy_switching_base(const std::function<int(int, int)>& cmp_fn,
-                                                     const GreedyKickOptions& opts) {
-    int n = igraph_vcount(&g);
-    std::vector<double> d(n);
-    for (int i = 0; i < n; ++i)
-        d[i] = switched_d_plus[i] - switched_d_minus[i];
+// signed_graph.cpp
+std::vector<int> SignedGraph::greedy_switching_base(
+    const std::function<int(int,int)>& cmp_fn,
+    const GreedyKickOptions& opts)
+{
+    const int n = n_;
+    const int m = m_;
 
-    std::vector<int> s(n, 0);
+    // --- Working switching s (start at +1) ---
+    std::vector<int> s(n, 1);
+    // If you maintain an external current switching, seed from it.
 
-    using Heap = boost::heap::pairing_heap<int, boost::heap::compare<std::function<bool(int, int)>> >;
-    std::unordered_map<int, Heap::handle_type> handles;
-    std::unordered_set<int> in_heap;
-
-    auto heap_cmp = [&](int a, int b) {
-        int cmp = cmp_fn(a, b);
-        if (d[a] < 0.0 && d[b] < 0.0 && cmp != 0) return cmp > 0;
-        if (d[a] == d[b]) return std::signbit(d[b]) && !std::signbit(d[a]);
-        return d[a] > d[b];
-    };
-
-    Heap pq(heap_cmp);
-    for (int i = 0; i < n; ++i) {
-        handles[i] = pq.push(i);
-        in_heap.insert(i);
+    // --- Edge signs under current switching: sigma_s(uv) in {-1,+1} ---
+    std::vector<double> sigma_s_edge_sign(m, 1.0);
+    for (int eid = 0; eid < m; ++eid) {
+        int u = edges_[eid].first, v = edges_[eid].second;
+        sigma_s_edge_sign[eid] = (double)s[u] * (double)signature_[eid] * (double)s[v];
     }
 
-    igraph_vector_int_t incident;
-    igraph_vector_int_init(&incident, 0);
+    // --- Fractional surrogate per-edge: \tilde\sigma = sigma_s * tau(x) ---
+    const bool has_frac = (opts.frac_x != nullptr);
+    const auto* X = opts.frac_x;
+    const auto* Y = opts.frac_y; // optional, only for salience
+    std::vector<double> tilde_sigma(m, 0.0);
 
-    auto find_max_clique = [&](std::unordered_set<int>& zero_nodes,
-                               const std::unordered_map<int, std::unordered_set<int>>& adj) -> std::vector<int> {
-        std::vector<int> best;
-        for (auto it = zero_nodes.begin(); it != zero_nodes.end(); ) {
-            int u = *it;
-            auto it_u = adj.find(u);
-            if (it_u == adj.end()) {
-                it = zero_nodes.erase(it);
-                continue;
-            }
-
-            std::vector<int> current_clique = {u};
-            for (int v : it_u->second) {
-                bool connected = true;
-                auto it_v = adj.find(v);
-                if (it_v == adj.end()) continue;
-                for (int w : current_clique) {
-                    if (!it_v->second.count(w)) {
-                        connected = false;
-                        break;
-                    }
-                }
-                if (connected) current_clique.push_back(v);
-            }
-            if (current_clique.size() > best.size()) best = std::move(current_clique);
-            it++;
+    auto rebuild_tilde_sigma = [&](){
+        if (!has_frac) {
+            // integer-only: tilde_sigma coincides with sigma_s
+            for (int eid = 0; eid < m; ++eid) tilde_sigma[eid] = sigma_s_edge_sign[eid];
+            return;
         }
-        return best;
+        for (int eid = 0; eid < m; ++eid) {
+            int u = edges_[eid].first, v = edges_[eid].second;
+            double tau = tau_from_x((*X)[u], (*X)[v]); // product surrogate
+            // signed zeros honored naturally via IEEE if tau==0
+            tilde_sigma[eid] = sigma_s_edge_sign[eid] * tau;
+        }
     };
 
-    // --- KICK summary acc (per-run & global) ---
-    static int RUNS = 0;
-    static long long SUM_KICKS = 0;
-    static long long SUM_CREATED_NEG = 0;
-    static double SUM_AW = 0.0;
-    static bool KICK_HDR = false;
+    // --- Fractional net degrees \tilde d_u (sum of tilde_sigma over incident edges) ---
+    std::vector<double> dtilde(n, 0.0);
+    auto rebuild_dtilde = [&](){
+        std::fill(dtilde.begin(), dtilde.end(), 0.0);
+        igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+        for (int u = 0; u < n; ++u) {
+            igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+            double sum = 0.0;
+            for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+                int eid = VECTOR(inc)[ii];
+                sum += tilde_sigma[eid]; // numerically computed; signed zero tag only on edges
+            }
+            dtilde[u] = sum;
+        }
+        igraph_vector_int_destroy(&inc);
+    };
 
-    int kicks_used = 0;
-    int created_neg_this_run = 0;
-    double aw_sum_this_run = 0.0;
+    // --- Count negatives on current signature (objective tracker) ---
+    auto count_mminus = [&](){
+        int neg = 0;
+        for (int eid = 0; eid < m; ++eid) if (sigma_s_edge_sign[eid] < 0.0) ++neg;
+        return neg;
+    };
 
-    while (!pq.empty()) {
-        int u = pq.top(); pq.pop();
-        if (d[u] > 0.0 || (d[u] == 0.0 && !std::signbit(d[u]))) {
-	        in_heap.erase(u);
-			std::unordered_set<int> zero_nodes;
-			for (int i = 0; i < n; ++i)
-			    if (d[i] == 0.0 && !std::signbit(d[i])) zero_nodes.insert(i);
-			
-			// Fast exit: if Z0 is empty, skip building the adjacency-over-Z0 (O(m)).
-			std::unordered_map<int, std::unordered_set<int>> adj;
-			if (!zero_nodes.empty()) {
-				for (int eid = 0; eid < igraph_ecount(&g); ++eid) {
-		            double& w = switched_weights[eid];
-		            if (w < 0.0 || (w == 0.0 && std::signbit(w))) continue;
-	                igraph_integer_t from, to;
-	                igraph_edge(&g, eid, &from, &to);
-	                int u = static_cast<int>(from);
-	                int v = static_cast<int>(to);
-	                if (zero_nodes.count(u) && zero_nodes.count(v)) {
-	                    adj[u].insert(v);
-	                    adj[v].insert(u);
-	                }
-	            }
+    // --- Apply one flip in working switching s and update sigma_s_edge_sign + tilde ---
+    auto flip_working = [&](int u){
+        s[u] = -s[u];
+        igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+        igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+        for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+            int eid = VECTOR(inc)[ii];
+            sigma_s_edge_sign[eid] = -sigma_s_edge_sign[eid];
+            // tilde flips sign because sigma_s flips
+            tilde_sigma[eid] = -tilde_sigma[eid];
+        }
+        igraph_vector_int_destroy(&inc);
+    };
+
+    // --- Initialize state ---
+    rebuild_tilde_sigma();
+    rebuild_dtilde();
+    int best_mminus = count_mminus();
+    std::vector<int> s_best = s;
+
+    // --- Round loop ---
+    for (int r = 0; r < opts.R_max; ++r) {
+        int z = 0; // consecutive zero-clique flips in this round
+
+        // A) Fractional greedy flips: min-heap by dtilde[u]
+        {
+            struct Node { int u; double key; double sal; };
+            auto cmp = [](const Node& a, const Node& b){
+                if (a.key != b.key) return a.key > b.key;      // min-heap
+                return a.sal < b.sal;                          // tie: larger sal first
+            };
+            std::priority_queue<Node,std::vector<Node>,decltype(cmp)> pq(cmp);
+
+            for (int u = 0; u < n; ++u) {
+                double sal_u = has_frac ? vertex_salience((*X)[u]) : 0.0;
+                pq.push({u, dtilde[u], sal_u});
             }
 
-			if (!zero_nodes.empty() && !adj.empty()) {
-                std::vector<int> clique = find_max_clique(zero_nodes, adj);
-                if (!clique.empty()) {
-                    u = clique.front();
-                    single_switching(u, &incident);
-                    s[u] = 1 - s[u];
-                    d[u] = switched_d_plus[u] - switched_d_minus[u];
-                    for (int v : clique) {
-                        if (v == u) continue;
-                        d[v] = switched_d_plus[v] - switched_d_minus[v];
-                        if (in_heap.count(v)) pq.update(handles[v], v);
-                        else {
-                            handles[v] = pq.push(v);
-                            in_heap.insert(v);
+            while (!pq.empty() && pq.top().key < 0.0) {
+                int u = pq.top().u; double k = pq.top().key; pq.pop();
+                if (dtilde[u] >= 0.0) continue; // lazy recheck
+
+                // Flip u in working state
+                flip_working(u);
+
+                // update dtilde locally
+                igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+                igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+
+                // flipping u flips the sign of all incident edge contributions
+                dtilde[u] = -dtilde[u];
+                for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+                    int eid = VECTOR(inc)[ii];
+                    int v = IGRAPH_OTHER(&g_, eid, u);
+                    // For neighbor v, its incident sum changes by +/-2*tilde contribution of that eid before flip.
+                    // But since we don't store the old per-edge, a safe route: recompute v's dtilde incrementally by:
+                    // dtilde[v] += (-tilde_old_eid - tilde_old_eid) = -2 * tilde_old_eid.
+                    // We can't get tilde_old_eid now (already negated). So rebuild neighbor's dtilde by scanning incident edges.
+                    // To stay simple & robust, rebuild only neighbors:
+                    double sumv = 0.0;
+                    igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
+                    igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                    for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) {
+                        int e2 = VECTOR(incv)[jj];
+                        sumv += tilde_sigma[e2];
+                    }
+                    dtilde[v] = sumv;
+                    igraph_vector_int_destroy(&incv);
+
+                    double sal_v = has_frac ? vertex_salience((*X)[v]) : 0.0;
+                    pq.push({v, dtilde[v], sal_v});
+                }
+                igraph_vector_int_destroy(&inc);
+
+                // Track best signature
+                int cur_mminus = count_mminus();
+                if (cur_mminus < best_mminus) {
+                    best_mminus = cur_mminus;
+                    s_best = s;
+                }
+                // Push u back
+                double sal_u = has_frac ? vertex_salience((*X)[u]) : 0.0;
+                pq.push({u, dtilde[u], sal_u});
+            }
+        }
+
+        // B) Fractional zero-clique step (strictly-positive edges, |Q|>=2), capped per-round
+        bool advanced = false;
+        if (z < opts.K_max) {
+            // Collect Z0 by numeric zero
+            std::vector<char> inZ0(n, 0);
+            std::vector<int> z0_vertices; z0_vertices.reserve(n);
+            for (int u = 0; u < n; ++u) if (dtilde[u] == 0.0) { inZ0[u] = 1; z0_vertices.push_back(u); }
+
+            if (!z0_vertices.empty()) {
+                // Find a maximal clique Q with high vertex salience
+                auto Q = maximal_salience_clique_strict_pos(z0_vertices, inZ0, tilde_sigma, X);
+                if (Q.size() >= 2) {
+                    int ustar = pick_u_star_in_Q(Q, tilde_sigma, Y);
+                    if (ustar != -1) {
+                        flip_working(ustar);
+
+                        // recompute dtilde only at ustar neighbors (simple & safe: rebuild neighbors)
+                        igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+                        igraph_incident(&g_, &inc, ustar, IGRAPH_ALL);
+                        dtilde[ustar] = -dtilde[ustar];
+                        for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+                            int eid = VECTOR(inc)[ii];
+                            int v = IGRAPH_OTHER(&g_, eid, ustar);
+                            double sumv = 0.0;
+                            igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
+                            igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                            for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) sumv += tilde_sigma[VECTOR(incv)[jj]];
+                            dtilde[v] = sumv;
+                            igraph_vector_int_destroy(&incv);
                         }
+                        igraph_vector_int_destroy(&inc);
+
+                        int cur_mminus = count_mminus();
+                        if (cur_mminus < best_mminus) { best_mminus = cur_mminus; s_best = s; }
+
+                        ++z;
+                        advanced = true;
                     }
-                    continue;
+                }
+            }
+        }
+        if (advanced) {
+            // go back to next round iteration (which restarts A)
+            continue;
+        }
+
+        // C) Integer detour (only if B cannot act)
+        {
+            // 1) projection
+            std::vector<int> s_int;
+            std::vector<double> sigma_int_edge_sign;
+            if (has_frac) integer_projection_from_x(*X, s_int, sigma_int_edge_sign);
+            else {
+                // if no fractional input, project from all-ones X (degenerate case)
+                std::vector<double> X1(n, 1.0);
+                integer_projection_from_x(X1, s_int, sigma_int_edge_sign);
+            }
+
+            // 2) integer greedy pass
+            std::vector<int> d_int;
+            integer_greedy_pass_minheap(sigma_int_edge_sign, s_int, d_int);
+
+            // 3) integer zero-clique (bounded; mirrors fractional case)
+            std::vector<int> S_replay; S_replay.reserve(opts.L_max);
+            for (int t = 0; t < opts.L_max; ++t) {
+                // Build Z0^int: d_int[u] == 0
+                std::vector<char> inZ0(n, 0);
+                std::vector<int> z0_vertices; z0_vertices.reserve(n);
+                for (int u = 0; u < n; ++u) if (d_int[u] == 0) { inZ0[u] = 1; z0_vertices.push_back(u); }
+
+                if (z0_vertices.empty()) break;
+
+                // Maximal clique Q on strictly positive edges in sigma_int
+                // Reuse tilde_sigma slot temporarily to avoid extra array: build from sigma_int
+                std::vector<double> sigma_int_as_tilde = sigma_int_edge_sign; // +1/-1
+                auto Q = maximal_salience_clique_strict_pos(z0_vertices, inZ0, sigma_int_as_tilde, X);
+                if (Q.size() < 2) break;
+
+                int ustar = pick_u_star_in_Q(Q, sigma_int_as_tilde, Y);
+                if (ustar == -1) break;
+
+                // Gate: deg(u*) on current working signature (sigma_s) <= Delta
+                // deg(u) = (#pos incident - #neg incident) under sigma_s
+                int deg_u = 0;
+                igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+                igraph_incident(&g_, &inc, ustar, IGRAPH_ALL);
+                for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+                    int eid = VECTOR(inc)[ii];
+                    if (sigma_s_edge_sign[eid] > 0.0) ++deg_u; else --deg_u;
+                }
+                igraph_vector_int_destroy(&inc);
+                if (deg_u > opts.Delta) {
+                    // try next best in Q
+                    // (simple: remove ustar and retry once)
+                    // You can implement a full ranking if needed.
+                    // For now, stop if gate fails at top choice.
+                    break;
+                }
+
+                // Accept in integer view
+                S_replay.push_back(ustar);
+
+                // Flip ustar in integer view
+                // This flips sigma_int_edge_sign and updates d_int as in greedy pass:
+                // reuse the logic from integer_greedy_pass_minheap for a single vertex.
+                {
+                    igraph_vector_int_t inc2; igraph_vector_int_init(&inc2, 0);
+                    igraph_incident(&g_, &inc2, ustar, IGRAPH_ALL);
+                    // flip s_int
+                    s_int[ustar] = -s_int[ustar];
+                    // degree update at ustar
+                    d_int[ustar] = -d_int[ustar];
+                    for (int ii = 0; ii < (int)igraph_vector_int_size(&inc2); ++ii) {
+                        int eid = VECTOR(inc2)[ii];
+                        int v = IGRAPH_OTHER(&g_, eid, ustar);
+                        double &sig = sigma_int_edge_sign[eid];
+                        double old = sig;
+                        sig = -sig; // flip
+                        if (sig > 0.0) d_int[v] += 2; else d_int[v] -= 2;
+                    }
+                    igraph_vector_int_destroy(&inc2);
                 }
             }
 
-            // ---- No negative-d vertex and no zero-clique switch: try guarded KICK ----
-            auto is_neg = [&](double w){ return (w < 0.0) || (w == 0.0 && std::signbit(w)); };
-            int m = igraph_ecount(&g);
-            int mminus = 0;
-            for (int eid = 0; eid < m; ++eid) if (is_neg(switched_weights[eid])) ++mminus;
-            bool gate = false;
-            if (opts.neg_edge_threshold_abs >= 0 && mminus > opts.neg_edge_threshold_abs) gate = true;
-            if (opts.neg_edge_threshold_frac >= 0 && (double)mminus / (double)m > opts.neg_edge_threshold_frac) gate = true;
+            // 4) Replay S_replay on fractional state; stop early if we create a fractional negative
+            bool created_neg = false;
+            std::vector<int> replayed;
+            for (int u : S_replay) {
+                flip_working(u);
 
-			if (kicks_used < opts.max_kicks && gate) {
-			    // --- Build Z0 (zero net-degree vertices) ---
-			    std::vector<char> inZ0(n, 0);
-			    int Z0count = 0;
-			    for (int i = 0; i < n; ++i)
-			        if (d[i] == 0.0 && !std::signbit(d[i])) { inZ0[i] = 1; ++Z0count; }
-			
-			    auto positive_weight = [&](int eid){
-			        double w = switched_weights[eid];
-			        return (w > 0.0) || (w == 0.0 && !std::signbit(w));
-			    };
-			
-			    // Fast path: if Z0 is empty and the policy says “don’t relax”, don’t try KICK.
-			    if (Z0count == 0 && !opts.relax_to_all_pos_if_Z0_empty) {
-			        break; // exit the greedy loop as before
-			    }
-			    const bool restrict_to_Z0 = (Z0count > 0);  // if Z0 exists, keep the classic restriction
-			
-			    int best_u = -1; double best_score = 0.0; double best_aw = 0.0; int best_created = 0;
-			
-			    igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-			    for (int cand = 0; cand < n; ++cand) {
-			        igraph_incident(&g, &inc, cand, IGRAPH_ALL);
-			        const int deg  = (int)igraph_vector_int_size(&inc);
-			        const int scan = std::min(deg, opts.neighbor_cap);
-			
-			        // --- O(scan) estimate of Δm⁻ for flipping 'cand' (pos→neg minus neg→pos) ---
-			        // Sample the first 'scan' incident edges without any Z0 restriction.
-			        int sample_pos = 0, sample_neg = 0;
-			        for (int ii = 0; ii < scan; ++ii) {
-			            int eid = VECTOR(inc)[ii];
-			            double w = switched_weights[eid];
-			            if ((w > 0.0) || (w == 0.0 && !std::signbit(w))) ++sample_pos;
-			            else                                            ++sample_neg;
-			        }
-			        // Scale the sample to a conservative integer estimate of the full degree effect.
-			        // Using ceil() to be cautious; if scan==deg this equals the exact value.
-			        const double scale = (scan > 0 ? (double)deg / (double)scan : 1.0);
-			        const int delta_m_minus_est = (scan > 0)
-			                                    ? (int)std::ceil((sample_pos - sample_neg) * scale)
-			                                    : 0;
-			
-			        // Hard gate: skip vertices whose estimated Δm⁻ exceeds the cap.
-			        if (delta_m_minus_est > opts.delta_m_minus_cap) {
-			            continue;
-			        }
-			
-			        // --- First pass: score using allowed neighbors (Z0 or all-positive when relaxed) ---
-			        double Aw = 0.0; int created = 0;
-			        std::vector<int> posN; posN.reserve(scan);
-			
-			        for (int ii = 0; ii < scan; ++ii) {
-			            int eid = VECTOR(inc)[ii];
-			            if (!positive_weight(eid)) continue; // only positive neighbors pre-flip
-			            int v = IGRAPH_OTHER(&g, eid, cand);
-			            if (restrict_to_Z0 && !inZ0[v]) continue; // restrict to Z0 if requested
-			
-			            double w = switched_weights[eid];
-			            double sal = 0.0;
-			            if (opts.edge_salience && eid < (int)opts.edge_salience->size()) {
-			                sal = (*(opts.edge_salience))[eid];
-			                if      (sal < 0.0) sal = 0.0;
-			                else if (sal > 1.0) sal = 1.0;
-			            }
-			
-			            // salience-nudged contribution (nonnegative, preserves weighting mode)
-			            const double contrib = (opts.use_weighted_degree ? w : 1.0) * (1.0 + opts.kick_salience_bias * sal);
-			            Aw += contrib;
-			            ++created;
-			            posN.push_back(v);
-			        }
-			        if (Aw <= 0.0) continue;
-			
-			        double score = Aw;
-			
-			        // Optional soft penalty (kept for parity; you can set penalty=0 to skip)
-			        if (opts.delta_m_minus_penalty > 0.0 && delta_m_minus_est > 0)
-			            score -= opts.delta_m_minus_penalty * (double)delta_m_minus_est;
-			
-			        // Triangle tiebreak on the (already bounded) posN
-			        if (opts.use_triangle_tiebreak && !posN.empty()) {
-			            int cap = opts.triangle_cap_per_u;
-			            int counted = 0, neg_pairs = 0;
-			            for (size_t i1 = 0; i1 < posN.size() && counted < cap; ++i1) {
-			                for (size_t i2 = i1 + 1; i2 < posN.size() && counted < cap; ++i2) {
-			                    int v = posN[i1], wv = posN[i2];
-			                    igraph_integer_t eid_vw;
-			                    if (igraph_get_eid(&g, &eid_vw, v, wv, 0, 0) == IGRAPH_SUCCESS) {
-			                        double w = switched_weights[eid_vw];
-			                        if ((w < 0.0) || (w == 0.0 && std::signbit(w))) ++neg_pairs;
-			                    }
-			                    ++counted;
-			                }
-			            }
-			            score += opts.triangle_beta * (double)neg_pairs;
-			        }
-			
-			        if (score > best_score) {
-			            best_score = score; best_u = cand; best_aw = Aw; best_created = created;
-			        }
-			    }
-			    igraph_vector_int_destroy(&inc);
-			
-			    if (best_u != -1 && best_score > 0.0 /*kick applies*/) {
-			        single_switching(best_u, &incident);
-			        s[best_u] = 1 - s[best_u];
-			        d[best_u] = switched_d_plus[best_u] - switched_d_minus[best_u];
-			        for (int i = 0; i < igraph_vector_int_size(&incident); ++i) {
-			            int v = IGRAPH_OTHER(&g, VECTOR(incident)[i], best_u);
-			            d[v] = switched_d_plus[v] - switched_d_minus[v];
-			            if (in_heap.count(v)) pq.update(handles[v], v);
-			            else if (d[v] < 0.0 || (d[v] == 0.0 && std::signbit(d[v]))) {
-			                handles[v] = pq.push(v);
-			                in_heap.insert(v);
-			            }
-			        }
-			        ++kicks_used;
-			        created_neg_this_run += best_created;
-			        aw_sum_this_run += best_aw;
-			        std::cout << "[KICK] M-=" << mminus << "/" << m
-			                  << ", |Z0|=" << Z0count
-			                  << ", u*=" << best_u
-			                  << ", Aw=" << best_aw
-			                  << ", created=" << best_created
-			                  << std::endl;
-			        continue; // resume greedy; fresh negatives likely exist
-			    }
-			}
-            break;
-        }
+                // Refresh dtilde for u and neighbors (local rebuild)
+                igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
+                igraph_incident(&g_, &inc, u, IGRAPH_ALL);
+                dtilde[u] = -dtilde[u];
+                for (int ii = 0; ii < (int)igraph_vector_int_size(&inc); ++ii) {
+                    int eid = VECTOR(inc)[ii];
+                    int v = IGRAPH_OTHER(&g_, eid, u);
+                    double sumv = 0.0;
+                    igraph_vector_int_t incv; igraph_vector_int_init(&incv, 0);
+                    igraph_incident(&g_, &incv, v, IGRAPH_ALL);
+                    for (int jj = 0; jj < (int)igraph_vector_int_size(&incv); ++jj) sumv += tilde_sigma[VECTOR(incv)[jj]];
+                    dtilde[v] = sumv;
+                    igraph_vector_int_destroy(&incv);
+                    if (dtilde[v] < 0.0) created_neg = true;
+                }
+                igraph_vector_int_destroy(&inc);
 
-        in_heap.erase(u);
-        single_switching(u, &incident);
-        s[u] = 1 - s[u];
-        d[u] = switched_d_plus[u] - switched_d_minus[u];
+                replayed.push_back(u);
+                if (dtilde[u] < 0.0) created_neg = true;
 
-        for (int i = 0; i < igraph_vector_int_size(&incident); ++i) {
-            int v = IGRAPH_OTHER(&g, VECTOR(incident)[i], u);
-            d[v] = switched_d_plus[v] - switched_d_minus[v];
-
-            if (in_heap.count(v))
-                pq.update(handles[v], v);
-            else if (d[v] < 0.0 || (d[v] == 0.0 && std::signbit(d[v]))) {
-                handles[v] = pq.push(v);
-                in_heap.insert(v);
+                if (created_neg) break;
             }
-        }
-    }
 
-    igraph_vector_int_destroy(&incident);
+            if (created_neg) {
+                int cur_mminus = count_mminus();
+                if (cur_mminus < best_mminus) { best_mminus = cur_mminus; s_best = s; }
+                // Continue next round (go back to A in the for-loop)
+                continue;
+            } else {
+                // rollback flips from replay (no effect)
+                for (int i = (int)replayed.size()-1; i >= 0; --i) {
+                    flip_working(replayed[i]); // revert
+                }
+                // nothing advanced; round ends
+            }
+        } // end detour
 
-    // --- Per-run KICK summary aggregation & periodic print ---
-    ++RUNS;
-    SUM_KICKS += kicks_used;
-    SUM_CREATED_NEG += created_neg_this_run;
-    SUM_AW += aw_sum_this_run;
-    if (RUNS % 50 == 0) {
-        if (!KICK_HDR) {
-            std::cout << std::setw(10) << "Runs"
-                      << std::setw(12) << "Kicks"
-                      << std::setw(16) << "AvgAw/Run"
-                      << std::setw(16) << "AvgCreated"
-                      << std::endl;
-            KICK_HDR = true;
-        }
-        double avgAw = (RUNS ? (SUM_AW / RUNS) : 0.0);
-        double avgCr = (RUNS ? ((double)SUM_CREATED_NEG / RUNS) : 0.0);
-        std::cout << std::setw(10) << RUNS
-                  << std::setw(12) << SUM_KICKS
-                  << std::setw(16) << avgAw
-                  << std::setw(16) << avgCr
-                  << std::endl;
-    }
+        // If we reach here with no advance, break early
+        break;
+    } // rounds
 
-    return s;
+    return s_best;
 }
 
 

@@ -98,8 +98,18 @@ public:
 		bool   relax_to_all_pos_if_Z0_empty = true;   // enable KICKs even if Z0=∅
 		int    delta_m_minus_cap = 512;               // allow modest M⁻ growth (bound Dijkstra)
 		double delta_m_minus_penalty = 0.0;           // no soft penalty (keep scoring cheap)
- };
 
+	    // --- NEW: caps & gates for the new heuristic ---
+	    int R_max = 2;            // round cap
+	    int K_max = 1;            // max consecutive zero-clique flips per round
+	    int L_max = 2;            // max integer zero-clique flips in the detour
+	    int Delta = 0;            // transient gate: allow deg(u) <= Delta on current working signature
+	
+	    // If fractional input is available (x,y), set these pointers (do not own).
+	    // If null, run the integer-only variant (degenerates to old greedy).
+	    const std::vector<double>* frac_x = nullptr;
+	    const std::vector<double>* frac_y = nullptr; // not used in tau; still optional for salience
+	};
 
 protected:
     std::vector<int> greedy_switching_base(const std::function<int(int, int)>& cmp_fn,
@@ -113,6 +123,31 @@ private:
     MapType _edge_index;
 
     void compute_degrees();
+	static bool strictly_positive(double w);
+	static double vertex_salience(double x);
+	static double edge_salience_from_y(double y);
+	static double tau_from_x(double xu, double xv);
+	
+	std::vector<int> maximal_salience_clique_strict_pos(
+	    const std::vector<int>& z0_vertices,
+	    const std::vector<char>& inZ0,
+	    const std::vector<double>& switched_frac_edge_sign,
+	    const std::vector<double>* frac_x) const;
+	
+	int pick_u_star_in_Q(
+	    const std::vector<int>& Q,
+	    const std::vector<double>& switched_frac_edge_sign,
+	    const std::vector<double>* frac_y) const;
+	
+	void integer_projection_from_x(
+	    const std::vector<double>& x,
+	    std::vector<int>& s_int,
+	    std::vector<double>& sigma_int_edge_sign) const;
+	
+	void integer_greedy_pass_minheap(
+	    std::vector<double>& sigma_int_edge_sign,
+	    std::vector<int>& s_int,
+	    std::vector<int>& d_int) const;
 	void single_switching(int u, igraph_vector_int_t* incident);
 
 public:
