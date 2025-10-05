@@ -80,12 +80,9 @@ bool SignedGraphForMIP::weighting_from_fractional(const std::vector<double>& x,
 const std::vector<int> SignedGraphForMIP::greedy_switching()
 {
     SignedGraph::GreedyKickOptions opts;
-    std::vector<double> X1(graph_.n(), 1.0);
-    opts.frac_x = &X1;  // product surrogate = 1 => integer behavior
-    // leave frac_y null
-
-    auto s = graph_.greedy_switching_base(/*cmp_fn=*/nullptr, opts);
-    return s;
+    std::vector<double> X1(this->n(), 1.0);
+	// pure integer greedy: leave opts.frac_x/frac_y as nullptr
+    return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts);
 }
 
 // ---- fractional_greedy_switching overloads (SignedGraphForMIP) ----
@@ -96,16 +93,15 @@ std::optional<std::shared_ptr<const std::vector<int>>>
 SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts)
 {
     SignedGraph::GreedyKickOptions opts = user_opts;
-    opts.frac_x = &this->frac_x_;  // store x from LP
-    opts.frac_y = &this->frac_y_;  // optional, only for salience
+    // If you have LP vectors available at this call site, assign them here:
+    // opts.frac_x = &lp_x;  // e.g., vectors pulled from your MIP callback
+    // opts.frac_y = &lp_y;  // optional (only used for salience)
+    // Otherwise leave them nullptr; the heuristic will still run (uniform τ/salience).
 
     // IMPORTANT: do not build tau from y; the graph’s greedy_switching_base uses product surrogate from x
     // Salience: if you have an internal edge_salience_view() from y, keep it; otherwise pass frac_y to score edges.
 
-    auto s_vec = std::make_shared<std::vector<int>>(
-        graph_.greedy_switching_base(/*cmp_fn=*/nullptr, opts)
-    );
-    return s_vec;
+    return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts)
 }
 
 // Backwards-compatible overload
