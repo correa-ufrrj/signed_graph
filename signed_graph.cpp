@@ -6,10 +6,14 @@
 #include <boost/heap/pairing_heap.hpp>
 #include <ostream>
 
-namespace {
-inline int sign_of(double w) {
-    return (w >= 0.0 && !(w == 0.0 && std::signbit(w))) ? +1 : -1;
+// signed_graph.cpp (top helper; keep a single definition)
+static inline int sign_of_num(double w) noexcept {
+    return (w > 0.0) - (w < 0.0); // +1, 0, or -1
 }
+
+std::ostream& operator<<(std::ostream& os, const Edge& e) {
+    os << "(" << e.first << ", " << e.second << ")";
+    return os;
 }
 
 SignedEdge SignedGraph::SignedEdgesView::operator[](igraph_integer_t eid) const {
@@ -298,24 +302,25 @@ int SignedGraph::pick_u_star_in_Q(
 
 void SignedGraph::integer_projection_from_x(
     const std::vector<double>& x,
-    std::vector<int>& s_int,           // out: s_int[u] = 1 - 2*round(x_u>=0.5)
-    std::vector<double>& sigma_int_edge_sign // out: +1 / -1 on edges after switching by s_int
-) const {
-    const int n = (int)x.size();
-    s_int.assign(n, 1);
+    std::vector<int>& s_int,
+    std::vector<double>& sigma_int_edge_sign) const
+{
+    const int n = n_;
+    const int m = m_;
+    s_int.resize(n);
+
+    // Round x -> s_int \in {+1,-1}
     for (int u = 0; u < n; ++u) {
-        int xu = (x[u] >= 0.5) ? 1 : 0;
-        s_int[u] = 1 - 2 * xu; // in {-1,+1}
+        s_int[u] = (x[u] >= 0.5) ? -1 : +1;   // s = 1 - 2*round(x)  (x>=.5 -> s=-1)
     }
-    // sigma_int(uv) = s_int[u] * sigma_s(uv) * s_int[v]
-    sigma_int_edge_sign.resize(igraph_ecount(&g)); // igraph_ecount(&g) is edge count
-    for (int eid = 0; eid < igraph_ecount(&g); ++eid) {
-		igraph_integer_t from, to;
-		igraph_edge(&g, eid, &from, &to);
-		int u = static_cast<int>(from), v = static_cast<int>(to);
-		// σ_int(uv) = s_int[u] * σ_s(uv) * s_int[v], where σ_s comes from the current working signature:
-		int sgn_s = sign_of(switched_weights[eid]);
-		sigma_int_edge_sign[eid] = static_cast<double>(s_int[u] * sgn_s * s_int[v]);
+
+    sigma_int_edge_sign.resize(m);
+    for (int eid = 0; eid < m; ++eid) {
+        const int u = edges_[eid].first;
+        const int v = edges_[eid].second;
+        // switched sign = s[u] * signature_[eid] * s[v]  in { -1, +1 }
+        sigma_int_edge_sign[eid] =
+            static_cast<double>(s_int[u]) * static_cast<double>(signature_[eid]) * static_cast<double>(s_int[v]);
     }
 }
 
@@ -532,7 +537,7 @@ std::vector<int> SignedGraph::greedy_switching_base(
     std::vector<double> sigma_s_edge_sign(m, 1.0);
     for (int eid = 0; eid < m; ++eid) {
 		double w = switched_weights[eid];
-		sigma_s_edge_sign[eid] = static_cast<double>( sign_of(w) );
+		sigma_s_edge_sign[eid] = static_cast<double>( sign_of_num(w) );
     }
 
     // --- Fractional surrogate per-edge: \tilde\sigma = sigma_s * tau(x) ---
