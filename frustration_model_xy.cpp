@@ -65,9 +65,13 @@ void FrustrationModelXY::build() {
 
     std::cout << "[FrustrationModel] Greedy swtching is being called." << std::endl;
 
-    // Upper bound
-    graph.restore_switched_sign();
-    std::vector<int> s = graph.greedy_switching();
+	// Upper bound
+	graph.restore_switched_sign();
+	std::vector<int> s = graph.greedy_switching();
+	
+	// NEW: apply the switching so the graph's positive/negative edges match s
+	graph.switching_from_partition(s);
+
     std::cout << "[BUILD-PHASE] greedy switching in "
               << std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - TB_mark).count() << "ms" << std::endl;
     TB_mark = clock::now();
@@ -217,21 +221,36 @@ void FrustrationModelXY::build() {
         lower_bound = std::max(lower_bound, nc);
 	}
     
-    // Initial solution
-    IloNumArray start_vals(env);
-    IloNumVarArray xy_vars(env);
-    for (int i = 0; i < n; ++i) {
-   	    model.add(x[i]);  // Ensure each x[i] is extracted
-        xy_vars.add(x[i]);
-        start_vals.add(static_cast<IloNum>(s[i]));
-    }
-    for (const auto& [edge, idxe] : edge_index) {
-        int u = edge.first;
-        int v = edge.second;
-   	    model.add(y[idxe]);  // Ensure each y[idxe] is extracted
-        xy_vars.add(y[idxe]);
-        start_vals.add(static_cast<IloNum>(s[u]*s[v]));
-    }
+	// Initial solution (feasible)
+	IloNumArray start_vals(env);
+	IloNumVarArray xy_vars(env);
+	
+	// map s ∈ {+1,-1} to x̂ ∈ {0,1}; choose 1 for s=-1, 0 for s=+1
+	auto s01 = [&](int si) -> IloNum { return (si == -1) ? 1.0 : 0.0; };
+	
+	// x-start
+	for (int i = 0; i < n; ++i) {
+	    model.add(x[i]);                // ensure extracted
+	    xy_vars.add(x[i]);
+	    start_vals.add(s01(s[i]));      // in {0,1}
+	}
+	
+	// y-start consistent with base constraints (tight but feasible)
+	for (const auto& [edge, idxe] : edge_index) {
+	    int u = edge.first, v = edge.second;
+	    model.add(y[idxe]);             // ensure extracted
+	    xy_vars.add(y[idxe]);
+	
+	    int xu = static_cast<int>(s01(s[u]));
+	    int xv = static_cast<int>(s01(s[v]));
+	    double w = weights[edge];       // sign of the edge
+	
+	    // For pos edges (w>0): y ≤ x_u and y ≤ x_v -> set y = min(x_u, x_v)
+	    // For neg edges (w<0): y ≥ x_u + x_v - 1       -> set y = max(0, x_u + x_v - 1)
+	    double y0 = (w > 0.0) ? static_cast<double>(std::min(xu, xv))
+	                          : static_cast<double>(std::max(0, xu + xv - 1));
+	    start_vals.add(y0);             // in [0,1] and satisfies constraints
+	}
     for (int i = 0; i < n; ++i) {
         int priority = d_plus[i] + d_minus[i];
         cplex.setPriority(x[i], priority);
@@ -240,8 +259,8 @@ void FrustrationModelXY::build() {
     injected_heuristic_solutions++;
     
     // Fix one variable to reduce symmetries
-    igraph_integer_t max_vertex = graph.max_degree_vertex();
-    model.add(x[max_vertex] == s[max_vertex]);
+	igraph_integer_t max_vertex = graph.max_degree_vertex();
+	model.add(x[max_vertex] == (s[max_vertex] == -1 ? 1 : 0));   // 0/1
     std::cout << "[BUILD-PHASE] symmetry fix in "
               << std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - TB_mark).count() << "ms" << std::endl;
 
@@ -974,90 +993,121 @@ void FrustrationModelXY::NegativeCycleCutGenerator::main(){ // compact signature
     }
 }
 
-
 void FrustrationModelXY::SwitchingHeuristicCallback::main() {
+    // Pull LP solution
+    std::vector<double> x_vals(owner.x.size()), y_vals(owner.y.size());
+    for (int i = 0; i < (int)owner.x.size(); ++i) x_vals[i] = getValue(owner.x[i]);
+    for (int i = 0; i < (int)owner.y.size(); ++i) y_vals[i] = getValue(owner.y[i]);
 
-    if (!owner.switching_solution) {
-		std::cout << "[Solver] No switching solution found." << std::endl;
-	    std::vector<double> x_vals(owner.x.size());
-	    std::vector<double> y_vals(owner.y.size());
-	    for (int i = 0; i < owner.x.size(); ++i)
-	        x_vals[i] = getValue(owner.x[i]);
-	    for (int i = 0; i < owner.y.size(); ++i)
-	        y_vals[i] = getValue(owner.y[i]);
+    // Reweight for the UB pass (local only!)
+    owner.graph.weighting_from_fractional(x_vals, y_vals);
 
-		owner.graph.weighting_from_fractional(x_vals, y_vals);
-        // UB HEURISTIC context (root-only polish, slightly more permissive)
-                // Decide if we are in a "flat" regime (many zero net-degrees) → allow extra restarts at root
-        int zero_nd = 0;
-        const auto& d_plus_v  = owner.graph.plus_degrees_view();
-        const auto& d_minus_v = owner.graph.minus_degrees_view();
-        for (int u = 0; u < (int)owner.x.size(); ++u) if ((d_plus_v[u] - d_minus_v[u]) == 0) ++zero_nd;
-        const double zero_ratio = (owner.x.empty()?0.0: double(zero_nd) / double(owner.x.size()));
-        const bool is_root = (getNnodes64() == 0);
-        const int max_kicks = (is_root && zero_ratio >= 0.30) ? 3 : 1;  // guarded extra restarts only at root
+    // Root-only polish knobs measured on the reweighted view
+    int zero_nd = 0;
+    {
+        const auto& d_plus_pol  = owner.graph.plus_degrees_view();
+        const auto& d_minus_pol = owner.graph.minus_degrees_view();
+        for (int u = 0; u < (int)owner.x.size(); ++u)
+            if ((d_plus_pol[u] - d_minus_pol[u]) == 0) ++zero_nd;
+    }
+    const bool   is_root    = (getNnodes64() == 0);
+    const double zero_ratio = owner.x.empty() ? 0.0 : double(zero_nd) / double(owner.x.size());
+    const int    max_kicks  = (is_root && zero_ratio >= 0.30) ? 3 : 1;
 
-        const SignedGraph::GreedyKickOptions UB_OPTS{
-            /*neg_edge_threshold_abs*/  -1,
-            /*neg_edge_threshold_frac*/ 0.03,
-            /*max_kicks*/              max_kicks,
-            /*use_weighted_degree*/    true,
-            /*use_triangle_tiebreak*/  true,
-            /*triangle_beta*/          (is_root ? 0.08 : 0.05),
-            /*neighbor_cap*/           1024,
-            /*triangle_cap_per_u*/     1024
-        };
-        auto result = owner.graph.fractional_greedy_switching(UB_OPTS);
+    const SignedGraph::GreedyKickOptions UB_OPTS{
+        /*neg_edge_threshold_abs*/  -1,
+        /*neg_edge_threshold_frac*/ 0.03,
+        /*max_kicks*/               max_kicks,
+        /*use_weighted_degree*/     true,
+        /*use_triangle_tiebreak*/   true,
+        /*triangle_beta*/           (is_root ? 0.08 : 0.05),
+        /*neighbor_cap*/            1024,
+        /*triangle_cap_per_u*/      1024
+    };
 
-	    if (result.has_value())
-	        owner.switching_solution = result.value();
-	    else
-			return;
-	}
-	else
-		std::cout << "[Solver] Switching solution inherited." << std::endl;
+    // Try fractional heuristic
+    auto frac_result = owner.graph.fractional_greedy_switching(UB_OPTS);
 
-    const std::vector<int>& s = *owner.switching_solution;
-    double incumbent = hasIncumbent() ? getIncumbentObjValue() : IloInfinity;
+    // Always restore global state before evaluating/printing/applying
+    owner.graph.restore_switched_sign();
 
-    double obj_val = 0.0;
-    const auto& d_plus = owner.graph.plus_degrees_view();
-    const auto& d_minus = owner.graph.minus_degrees_view();
-
-    for (int i = 0; i < owner.x.size(); ++i)
-        obj_val += (d_plus[i] - d_minus[i]) * s[i];
-
-    for (const auto& [edge, sign] : owner.signs) {
-        int idx = owner.edge_index[edge];
-        int y_val = s[edge.first] * s[edge.second];
-        obj_val += - 2.0 * sign * y_val;
+    // Normalize to shared_ptr<const vector<int>>
+    std::shared_ptr<const std::vector<int>> s_ptr;
+    if (frac_result.has_value()) {
+        s_ptr = frac_result.value();  // already shared_ptr
+        std::cout << "[Heuristic] switching solution (fractional) size=" << s_ptr->size() << "\n";
+    } else {
+        auto s_fb = owner.graph.greedy_switching();  // plain vector<int>
+        if (s_fb.empty()) {
+            std::cout << "[Heuristic] No switching solution found.\n";
+            return;
+        }
+        s_ptr = std::make_shared<const std::vector<int>>(std::move(s_fb));
+        std::cout << "[Heuristic] switching solution (fallback) size=" << s_ptr->size() << "\n";
     }
 
+    // If fractional returned the trivial assignment (=> all x_i = 0), fall back immediately
+    {
+        const std::vector<int>& s_test = *s_ptr;
+        const bool all_pos = std::all_of(s_test.begin(), s_test.end(),
+                                         [](int si){ return si == +1; });
+        if (all_pos) {
+            auto s_fb = owner.graph.greedy_switching(); // base heuristic on original graph
+            if (!s_fb.empty()) {
+                s_ptr = std::make_shared<const std::vector<int>>(std::move(s_fb));
+                std::cout << "[Heuristic] fractional was trivial; using base greedy instead.\n";
+            }
+        }
+    }
+
+    const std::vector<int>& s = *s_ptr;
+
+    // Evaluate in the 0/1 model space (views AFTER restore)
+    const auto& d_plus_eval  = owner.graph.plus_degrees_view();
+    const auto& d_minus_eval = owner.graph.minus_degrees_view();
+    auto s01 = [](int si) -> double { return (si == -1) ? 1.0 : 0.0; };
+
+    double obj_val = 0.0;
+    IloNumVarArray xy_vars(getEnv());
+    IloNumArray    xy_vals(getEnv());
+
+    // x part
+    for (int i = 0; i < (int)owner.x.size(); ++i) {
+        double xi = s01(s[i]);
+        xy_vars.add(owner.x[i]);
+        xy_vals.add(xi);
+        obj_val += (d_plus_eval[i] - d_minus_eval[i]) * xi;
+    }
+
+    // y part (tight, constraint-consistent initialization)
+    for (const auto& [edge, idxe] : owner.edge_index) {
+        int u = edge.first, v = edge.second;
+        int xu = (int)s01(s[u]);
+        int xv = (int)s01(s[v]);
+
+        // WeightsView supports operator[], not at()
+        double w = owner.weights[edge];
+
+        double y0 = (w > 0.0)
+                  ? (double)std::min(xu, xv)              // y ≤ x_u, y ≤ x_v
+                  : (double)std::max(0, xu + xv - 1);     // y ≥ x_u + x_v − 1
+
+        xy_vars.add(owner.y[idxe]);
+        xy_vals.add(y0);
+
+        obj_val += -2.0 * w * y0;
+    }
+
+    double incumbent = hasIncumbent() ? getIncumbentObjValue() : IloInfinity;
     std::cout << "Incumbent: " << incumbent << "\n";
     std::cout << "Objective value: " << obj_val << "\n";
 
-	if (obj_val < incumbent) {
-	    IloNumVarArray xy_vars(getEnv());
-	    IloNumArray xy_vals(getEnv());
-
-	    for (int i = 0; i < owner.x.size(); ++i) {
-	        xy_vars.add(owner.x[i]);
-	        xy_vals.add(static_cast<IloNum>(s[i]));
-	    }
-
-	    for (const auto& [edge, idxe] : owner.edge_index) {
-	        int u = edge.first;
-	        int v = edge.second;
-	        xy_vars.add(owner.y[idxe]);
-	        xy_vals.add(static_cast<IloNum>(s[u]*s[v]));
-	    }
-
-		setSolution(xy_vars, xy_vals);
-		std::cout << "[Heuristic] Proposed a solution with objective: " << obj_val << "\n";
-		owner.f_index = obj_val / owner.graph.edge_count();
-		owner.injected_heuristic_solutions++;
-	}
-    owner.switching_solution = nullptr;
+    if (obj_val < incumbent) {
+        setSolution(xy_vars, xy_vals);
+        std::cout << "[Heuristic] Proposed a solution with objective: " << obj_val << "\n";
+        owner.f_index = obj_val / owner.graph.edge_count();
+        owner.injected_heuristic_solutions++;
+    }
 }
 
 void FrustrationModelXY::export_solution(const std::string& file_prefix, bool with_svg) const {
