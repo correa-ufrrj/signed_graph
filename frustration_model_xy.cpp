@@ -3,6 +3,165 @@
 #include "frustration_model_xy.h"
 #include "frustration_model.h"
 #include <algorithm>
+#include <unordered_set>
+#include <unordered_map>
+#include <numeric>
+#include <cmath>
+
+// ============================================================
+// Helpers: key construction, reheat seeding, EMA weights
+// (placed early to avoid needing to touch the end of file)
+// ============================================================
+
+// Canonical CycleKey from an ordered vertex cycle.
+// Strategy:
+//  - map each consecutive pair (vi, v_{i+1}) including closure to y-index
+//  - choose rotation + direction (forward/reverse) with lexicographically smallest y-index sequence
+//  - set rhs=0 for 1-neg cycles (our pipeline) and record 'reversed' chosen
+fmkey::CycleKey
+FrustrationModelXY::NegativeCycleCutGenerator::make_key_from_vertices_(
+    const std::vector<int>& cyc_vertices) const
+{
+    fmkey::CycleKey key;
+    if (cyc_vertices.size() < 3) return key;
+
+    // Build edge index ring (undirected)
+    std::vector<int> ring;
+    ring.reserve(cyc_vertices.size());
+    const int L = (int)cyc_vertices.size();
+    for (int i = 0; i < L; ++i) {
+        int u = cyc_vertices[i];
+        int v = cyc_vertices[(i + 1) % L];
+        auto uv = std::minmax(u, v);
+        auto it = owner.edge_index.find({uv.first, uv.second});
+        if (it == owner.edge_index.end()) {
+            // missing edge; leave key empty (will be ignored)
+            key.y_idx.clear();
+            return key;
+        }
+        ring.push_back(it->second);
+    }
+
+    // All rotations of forward and reverse; pick lexicographically smallest
+    auto best = ring;
+    bool best_rev = false;
+    // forward rotations
+    for (int s = 1; s < L; ++s) {
+        std::vector<int> cand(L);
+        for (int i = 0; i < L; ++i) cand[i] = ring[(i + s) % L];
+        if (cand < best) best = std::move(cand);
+    }
+    // reverse base
+    std::vector<int> ring_rev(ring.rbegin(), ring.rend());
+    auto best_rev_seq = ring_rev;
+    for (int s = 1; s < L; ++s) {
+        std::vector<int> cand(L);
+        for (int i = 0; i < L; ++i) cand[i] = ring_rev[(i + s) % L];
+        if (cand < best_rev_seq) best_rev_seq = std::move(cand);
+    }
+    if (best_rev_seq < best) {
+        best = std::move(best_rev_seq);
+        best_rev = true;
+    }
+
+    key.y_idx = std::move(best);
+    key.rhs = 0;           // 1-neg cycles → floor(1/2)=0
+    key.reversed = best_rev;
+    return key;
+}
+
+// Build working weights on E⁺ using EMA repulsion (hist_edge_ema_)
+// and LP salience (ŷ), then clamp to [ε, w_cap_].
+void
+FrustrationModelXY::NegativeCycleCutGenerator::build_work_weights_(
+    const IloNumArray& /*x_hat*/, const IloNumArray& y_hat)
+{
+    const int m = (int)owner.edge_index.size();
+    if ((int)hist_edge_ema_.size() != m) hist_edge_ema_.assign(m, 0.0);
+    if ((int)work_w_pos_.size() != m)    work_w_pos_.assign(m, 1.0);
+
+    auto sal = [&](double yh)->double {
+        double d = std::abs(yh - 0.5);
+        double s = 1.0 - std::min(1.0, 2.0 * d);
+        return std::max(0.0, std::min(1.0, s));
+    };
+
+    for (const auto& kv : owner.edge_index) {
+        int eid = kv.second;
+        double base = 1.0; // persistent ω; currently flat (kept minimal here)
+        double rep  = lambda_hist_ * std::log1p(std::max(0.0, hist_edge_ema_[eid]));
+        double lp   = (eid < y_hat.getSize() ? lambda_lp_ * sal(y_hat[eid]) : 0.0);
+        double w    = base + rep - lp;
+        if (w < w_eps_) w = w_eps_;
+        if (w_cap_ > 0.0) w = std::min(w, w_cap_);
+        work_w_pos_[eid] = w;
+    }
+}
+
+// Reheat: if an item now has positive slack, anchor it to its unique
+// currently negative edge (if unique) and mark that anchor as "covered".
+// We DO NOT emit rows here; we only seed anchors/buckets.
+void
+FrustrationModelXY::NegativeCycleCutGenerator::reheat_seed_buckets_(
+    std::unordered_set<int>& reheated_anchors,
+    const std::vector<char>& neg_edge_mask,
+    const IloNumArray& /*x_hat*/, const IloNumArray& /*y_hat*/)
+{
+    if (reheat_pool_.empty()) return;
+
+    for (auto it = reheat_pool_.begin(); it != reheat_pool_.end(); ) {
+        const ReheatItem& item = it->second;
+        const auto& cyc = item.cyc_vertices;
+        if (cyc.size() < 3) { it = reheat_pool_.erase(it); continue; }
+
+        std::vector<int> neg_eids;
+        const int L = (int)cyc.size();
+        for (int i = 0; i < L; ++i) {
+            int u = cyc[i], v = cyc[(i+1)%L];
+            auto uv = std::minmax(u, v);
+            auto eit = owner.edge_index.find({uv.first, uv.second});
+            if (eit == owner.edge_index.end()) continue;
+            int eid = eit->second;
+            if (eid >= 0 && eid < (int)neg_edge_mask.size() && neg_edge_mask[eid]) {
+                neg_eids.push_back(eid);
+            }
+        }
+
+        if (neg_eids.size() == 1) {
+            reheated_anchors.insert(neg_eids[0]);
+            ++it;
+        } else {
+            ++it; // keep; might become 1-neg later
+        }
+    }
+}
+
+// After selection: update EMA from chosen cycles (edge densities) and
+// decay TTL/prune reheat entries that remain non-violated.
+void
+FrustrationModelXY::NegativeCycleCutGenerator::reheat_after_selection_(
+    const std::vector<int>& /*chosen_cids*/,
+    const std::vector<std::vector<int>>& cand_pos_edges,
+    const IloNumArray& /*x_hat*/, const IloNumArray& /*y_hat*/)
+{
+    for (const auto& pos_edges : cand_pos_edges) {
+        const double inc = (pos_edges.empty() ? 0.0 : 1.0 / (double)pos_edges.size());
+        for (int eid : pos_edges) {
+            if (eid >= 0 && eid < (int)hist_edge_ema_.size()) {
+                hist_edge_ema_[eid] = ema_decay_ * hist_edge_ema_[eid] + inc;
+            }
+        }
+    }
+    for (auto it = reheat_pool_.begin(); it != reheat_pool_.end(); ) {
+        if (it->second.ttl > 0) {
+            --(it->second.ttl);
+            ++it;
+        } else {
+            it = reheat_pool_.erase(it);
+        }
+    }
+}
+#include <algorithm>
 #include <stdexcept>
 
 FrustrationModelXY::FrustrationModelXY(SignedGraphForMIP& g, int cut_flags)
