@@ -45,11 +45,12 @@ private:
     bool triangle_cut_added_last_round = false;
 
     // ===== Reheat pool: switching-agnostic storage of previously seen cycles =====
-    struct ReheatItem {
-        fmkey::CycleKey key;
-        int ttl = 3;             // decays when not violated
-        double last_viol = 0.0;  // last measured slack at (x̂, ŷ)
-    };
+	struct ReheatItem {
+	  // canonical, switching-agnostic representation
+	  std::vector<int> cyc_vertices;   // ordered cycle
+	  int ttl = 3;
+	  double last_viol = 0.0;
+	};
     // Lives on the owner so it persists across callback duplications/rounds
     std::unordered_map<fmkey::CycleKey, ReheatItem, fmkey::CycleKeyHash, fmkey::CycleKeyEq> reheat_pool_;
     std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> in_model_keys_;   // already added
