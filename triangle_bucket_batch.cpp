@@ -1,4 +1,4 @@
-#include "triangle_bucket_batch_stream.h"
+#include "triangle_bucket_batch.h"
 
 // This translation unit is intentionally minimal.
 // All logic is in the header to keep the initial integration tiny and
@@ -7,13 +7,13 @@
 //
 // Example usage (to be wired later):
 //
-//   TriangleBucketBatchStream::PosAdj pos_adj = ...;        // G^+_σ
-//   TriangleBucketBatchStream::EdgeIndex edge_idx = ...;    // (u,v)->eid
+//   TriangleBucketBatch::PosAdj pos_adj = ...;        // G^+_σ
+//   TriangleBucketBatch::EdgeIndex edge_idx = ...;    // (u,v)->eid
 //   std::vector<std::pair<int,int>> neg_edges = ...;        // anchors
-//   TriangleBucketBatchStream::Params P{K,B,cap};
-//   TriangleBucketBatchStream stream(neg_edges, pos_adj, edge_idx, P);
+//   TriangleBucketBatch::Params P{K,B,cap};
+//   TriangleBucketBatch stream(neg_edges, pos_adj, edge_idx, P);
 //
-//   auto scorer = [&](TriangleBucketBatchStream::Candidate& c){
+//   auto scorer = [&](TriangleBucketBatch::Candidate& c){
 //       // fill c.score_primary, c.score_secondary, optionally c.viol/c.phi
 //   };
 //   stream.build_buckets(scorer);
@@ -28,7 +28,7 @@
 //
 // that fills c.score_primary, c.score_secondary (and optionally c.viol, c.phi).
 template <class Scorer>
-void build_TriangleBucketBatchStream::buckets(Scorer&& scorer) {
+void build_TriangleBucketBatch::buckets(Scorer&& scorer) {
     buckets_.clear();
     // Build fast membership for positive adjacency (per u)
     // We'll reuse pos_adj_ directly; to check common neighbors, we
@@ -80,7 +80,7 @@ void build_TriangleBucketBatchStream::buckets(Scorer&& scorer) {
 //
 // Returns indices into internal 'selected_' vector; also outputs the set of
 // covered anchors (neg edge ids) in 'covered_neg_out'.
-const std::vector<Candidate>& TriangleBucketBatchStream::select(std::vector<EdgeId>& covered_neg_out) {
+const std::vector<Candidate>& TriangleBucketBatch::select(std::vector<EdgeId>& covered_neg_out) {
     selected_.clear();
     covered_neg_out.clear();
 
@@ -127,26 +127,26 @@ const std::vector<Candidate>& TriangleBucketBatchStream::select(std::vector<Edge
 }
 
 // Access selected triangles
-const std::vector<Candidate>& TriangleBucketBatchStream::selected() const { return selected_; }
+const std::vector<Candidate>& TriangleBucketBatch::selected() const { return selected_; }
 
 // Access buckets (read-only)
-const std::unordered_map<EdgeId, std::vector<Candidate>>& TriangleBucketBatchStream::buckets() const { return buckets_; }
+const std::unordered_map<EdgeId, std::vector<Candidate>>& TriangleBucketBatch::buckets() const { return buckets_; }
 
-const Params& TriangleBucketBatchStream::params() const { return P_; }
+const Params& TriangleBucketBatch::params() const { return P_; }
 Params& params() { return P_; }
 
 // Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
-static long long TriangleBucketBatchStream::key_(VertexId a, VertexId b) {
+static long long TriangleBucketBatch::key_(VertexId a, VertexId b) {
     if (a > b) std::swap(a, b);
     return ( (static_cast<long long>(a) << 32) ^ static_cast<unsigned long long>(b) );
 }
 
-EdgeId TriangleBucketBatchStream::eid_(VertexId a, VertexId b) const {
+EdgeId TriangleBucketBatch::eid_(VertexId a, VertexId b) const {
     auto it = edge_index_.find(key_(a,b));
     return (it == edge_index_.end()) ? -1 : it->second;
 }
 
-void TriangleBucketBatchStream::ensure_sorted_adjacency_() {
+void TriangleBucketBatch::ensure_sorted_adjacency_() {
     if (adj_sorted_) return;
     for (auto& nbrs : const_cast<PosAdj&>(pos_adj_)) {
         std::sort(nbrs.begin(), nbrs.end());
@@ -155,18 +155,18 @@ void TriangleBucketBatchStream::ensure_sorted_adjacency_() {
     adj_sorted_ = true;
 }
 
-bool TriangleBucketBatchStream::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
+bool TriangleBucketBatch::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
     auto ok = [&](VertexId x){ return used[x] < P_.cap_per_vertex; };
     return ok(c.u) && ok(c.v) && ok(c.w);
 }
 
-bool TriangleBucketBatchStream::already_taken_(const Candidate& c) const {
+bool TriangleBucketBatch::already_taken_(const Candidate& c) const {
     // cheap set check by (neg_eid, w) would suffice, but keep full triplet
     auto key = std::tuple<VertexId,VertexId,VertexId>(c.u,c.w,c.v);
     return taken_.find(key) != taken_.end();
 }
 
-void TriangleBucketBatchStream::commit_(const Candidate& c, std::vector<int>& used) {
+void TriangleBucketBatch::commit_(const Candidate& c, std::vector<int>& used) {
     used[c.u]++; used[c.v]++; used[c.w]++;
     selected_.push_back(c);
     taken_.insert(std::tuple<VertexId,VertexId,VertexId>(c.u,c.w,c.v));

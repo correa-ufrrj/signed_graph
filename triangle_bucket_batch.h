@@ -31,7 +31,7 @@
 //   VertexId: integer id of a vertex
 //   EdgeId  : integer id of an undirected edge (consistent with model y-index)
 //
-class TriangleBucketBatchStream {
+class TriangleBucketBatch {
 public:
     using VertexId = int;
     using EdgeId   = int;
@@ -67,11 +67,11 @@ public:
     // pos_adj  : adjacency of G^+_σ
     // edge_index: map (min(u,v),max(u,v)) -> y-index / internal edge id
     // params   : see Params
-    explicit TriangleBucketBatchStream(const std::vector<std::pair<VertexId,VertexId>>& neg_edges,
+    explicit TriangleBucketBatch(const std::vector<std::pair<VertexId,VertexId>>& neg_edges,
                                        const PosAdj& pos_adj,
                                        const EdgeIndex& edge_index,
                                        Params params = {})
-        : neg_edges_(neg_edges), pos_adj_(pos_adj), edge_index_(edge_index), P_(params) {}
+        : neg_edges_(neg_edges), pos_adj_(pos_adj), edge_index_(edge_index), P_(params) {};
 
     // Hook to compute the primary & secondary score and optional cached metrics.
     // The caller supplies a functor:
