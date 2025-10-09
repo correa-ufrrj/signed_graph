@@ -28,6 +28,8 @@ set(SOURCES
     frustration_model_xy.cpp
     frustration_model_x.cpp
     modularity_model.cpp
+    triangle_bucket_batch_stream.cpp
+    negative_cycle_batch_stream.cpp
     signed_graph.cpp
     signed_graph_mip.cpp
 )
