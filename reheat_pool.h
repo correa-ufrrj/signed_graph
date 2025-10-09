@@ -10,6 +10,8 @@
 struct ReheatItem {
     std::vector<int> cyc_vertices; // cycle as vertex ring; owner canonicalizes to CycleKey
     int ttl = 3;                   // rounds to live; decremented after selection
+    double ema_viol = 0.0;         // exponentially-weighted mean violation
+    double last_viol = 0.0;        // last observed violation (for debugging/telemetry)
 };
 
 class ReheatPool {
@@ -45,6 +47,18 @@ public:
     bool          contains(const Key& key) const;
     const Value*  find(const Key& key) const;
     Value*        find_mutable(const Key& key);
+
+    // Decrement TTLs; erase entries that reach TTL==0 or already TTL<=0.
+    // Returns {decremented_count, erased_count}.
+    std::pair<std::size_t, std::size_t> prune_by_ttl();
+
+    // Maintain an EMA of violation for a key:
+    // ema <- alpha*viol + (1-alpha)*ema, stores last_viol=viol. Alpha in [0,1].
+    void update_ema(const Key& key, double viol, double alpha);
+
+    // Combined pruning: TTL decrement + erase-on-zero, and erase items with ema_viol < ema_min.
+    // Returns {decremented_count, erased_count}.
+    std::pair<std::size_t, std::size_t> prune_by_ttl_and_ema(double ema_min);
 
 private:
     MapT pool_;

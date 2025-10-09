@@ -2,6 +2,7 @@
 // File: src/reheat_pool.cpp
 // ============================================================================
 #include "reheat_pool.h"
+#include <algorithm>
 
 bool ReheatPool::empty() const noexcept { return pool_.empty(); }
 std::size_t ReheatPool::size() const noexcept { return pool_.size(); }
@@ -36,3 +37,65 @@ ReheatPool::Value* ReheatPool::find_mutable(const Key& key) {
     return it == pool_.end() ? nullptr : &it->second;
 }
 
+std::pair<std::size_t, std::size_t> ReheatPool::prune_by_ttl() {
+    std::size_t decremented = 0;
+    std::size_t erased = 0;
+    for (auto it = pool_.begin(); it != pool_.end(); ) {
+        auto& item = it->second;
+        if (item.ttl > 0) {
+            --item.ttl;
+            ++decremented;
+            if (item.ttl == 0) {
+                it = pool_.erase(it);
+                ++erased;
+            } else {
+                ++it;
+            }
+        } else {
+            it = pool_.erase(it);
+            ++erased;
+        }
+    }
+    return {decremented, erased};
+}
+
+void ReheatPool::update_ema(const Key& key, double viol, double alpha) {
+    // Clamp alpha for safety.
+    if (alpha < 0.0) alpha = 0.0;
+    if (alpha > 1.0) alpha = 1.0;
+    auto it = pool_.find(key);
+    if (it == pool_.end()) return;
+    auto& item = it->second;
+    item.ema_viol = alpha * viol + (1.0 - alpha) * item.ema_viol;
+    item.last_viol = viol;
+}
+
+std::pair<std::size_t, std::size_t> ReheatPool::prune_by_ttl_and_ema(double ema_min) {
+    std::size_t decremented = 0;
+    std::size_t erased = 0;
+    for (auto it = pool_.begin(); it != pool_.end(); ) {
+        auto& item = it->second;
+        bool erase = false;
+        // TTL policy: decrement >0 and erase if hits 0; erase if already <=0.
+        if (item.ttl > 0) {
+            --item.ttl;
+            ++decremented;
+            if (item.ttl == 0) {
+                erase = true;
+            }
+        } else {
+            erase = true;
+        }
+        // EMA policy: prune if below threshold (chronically non-violated).
+        if (!erase && item.ema_viol < ema_min) {
+            erase = true;
+        }
+        if (erase) {
+            it = pool_.erase(it);
+            ++erased;
+        } else {
+            ++it;
+        }
+    }
+    return {decremented, erased};
+}
