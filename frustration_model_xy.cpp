@@ -2,6 +2,8 @@
 
 #include "frustration_model_xy.h"
 #include "frustration_model.h"
+#include "cycle_key.h"
+#include "reheat_pool.h"
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>

@@ -7,29 +7,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
-
-// ---------------------------------------------------------------------
-// Switching-invariant, orientation-aware key for cycle identification.
-// Header-only so callbacks and owner share the same type.
-// ---------------------------------------------------------------------
-namespace fmkey {
-  struct CycleKey {
-    std::vector<int> y_idx;  // canonical y-indices of the cycle
-    int rhs{0};
-    bool reversed{false};
-  };
-  struct CycleKeyHash {
-    size_t operator()(const CycleKey& k) const noexcept {
-      std::uint64_t h = 1469598103934665603ull;                 // FNV-1a
-      auto mix = [&](std::uint64_t v){ h ^= v; h *= 1099511628211ull; };
-      for (int v : k.y_idx) mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(v)));
-      mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.rhs)));
-      mix(static_cast<std::uint64_t>(k.reversed ? 1u : 0u));
-      return static_cast<size_t>(h);
-    }
-  };
-  struct CycleKeyEq { bool operator()(const CycleKey& a, const CycleKey& b) const noexcept { return a.rhs==b.rhs && a.reversed==b.reversed && a.y_idx==b.y_idx; } };
-} // namespace fmkey
+#include "cycle_key.h"
+#include "reheat_pool.h"
 
 class FrustrationModelXY : public FrustrationModel {
 public:
@@ -45,14 +24,8 @@ private:
     bool triangle_cut_added_last_round = false;
 
     // ===== Reheat pool: switching-agnostic storage of previously seen cycles =====
-	struct ReheatItem {
-	  // canonical, switching-agnostic representation
-	  std::vector<int> cyc_vertices;   // ordered cycle
-	  int ttl = 3;
-	  double last_viol = 0.0;
-	};
     // Lives on the owner so it persists across callback duplications/rounds
-    std::unordered_map<fmkey::CycleKey, ReheatItem, fmkey::CycleKeyHash, fmkey::CycleKeyEq> reheat_pool_;
+    ReheatPool reheat_pool_;
     std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> in_model_keys_;   // already added
     std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> recent_keys_;     // de-dupe within recent rounds
     struct ReheatParams {
