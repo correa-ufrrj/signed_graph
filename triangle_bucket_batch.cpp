@@ -1,10 +1,25 @@
 #include "triangle_bucket_batch.h"
+#include <unordered_map>
 
-// This translation unit is intentionally minimal.
-// All logic is in the header to keep the initial integration tiny and
-// avoid touching existing build glue. If you prefer, you can move the
-// implementation here later with explicit template instantiations.
-//
+// Weak, overridable integration hooks:
+extern "C" {
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+void TBB_on_emit(int /*edge_id*/, double /*used_density*/) {}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+void TBB_on_accept(int /*edge_id*/, double /*density*/) {}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int TBB_budget_override(int base) { return base; }
+}
+
+
 // Example usage (to be wired later):
 //
 //   TriangleBucketBatch::PosAdj pos_adj = ...;        // G^+_σ
@@ -19,8 +34,8 @@
 //   stream.build_buckets(scorer);
 //   std::vector<int> covered;
 //   const auto& chosen = stream.select(covered);
-
-
+//
+//
 // Hook to compute the primary & secondary score and optional cached metrics.
 // The caller supplies a functor:
 //
@@ -29,7 +44,8 @@
 // that fills c.score_primary, c.score_secondary (and optionally c.viol, c.phi).
 template <class Scorer>
 void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
-    buckets_.clear();
+    // Do not clear: allow reheat-preseeded buckets (buck^(0)) to participate
+    // buckets_.clear();
     // Build fast membership for positive adjacency (per u)
     // We'll reuse pos_adj_ directly; to check common neighbors, we
     // two-pointer merge after sorting neighbor lists (we sort once lazily).
@@ -82,6 +98,7 @@ void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
 // covered anchors (neg edge ids) in 'covered_neg_out'.
 const std::vector<Candidate>& TriangleBucketBatch::select(std::vector<EdgeId>& covered_neg_out) {
     selected_.clear();
+    taken_.clear();
     covered_neg_out.clear();
 
     if (buckets_.empty() || P_.B_tri <= 0) return selected_;
@@ -93,6 +110,15 @@ const std::vector<Candidate>& TriangleBucketBatch::select(std::vector<EdgeId>& c
     keys.reserve(buckets_.size());
     for (auto& kv : buckets_) keys.push_back(kv.first);
     std::sort(keys.begin(), keys.end());
+    // Spec: covered_neg_out lists all nonempty bucket keys (incl. reheat-seeded)
+    for (EdgeId key : keys) {
+        if (!buckets_[key].empty()) covered_neg_out.push_back(key);
+    }
+
+    // Annealed budget and within-batch density (positive edges only)
+    int budget = TBB_budget_override(P_.B_tri);
+    std::unordered_map<EdgeId, double> used_in_this_batch;
+
 
     // Pass 1: one per bucket
     for (EdgeId key : keys) {
@@ -100,15 +126,23 @@ const std::vector<Candidate>& TriangleBucketBatch::select(std::vector<EdgeId>& c
         for (const auto& c : buck) {
             if (!respect_cap_(c, used_per_vertex)) continue;
             commit_(c, used_per_vertex);
-            covered_neg_out.push_back(key);
+            // Cross-batch density: add 1/3 to all three edges of the triangle
+            TBB_on_accept(c.neg_eid,    1.0/3.0);
+            TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
+            TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
+            // Within-batch mask bump on positive edges
+            used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
+            used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
+            TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
+            TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
             break; // at most one in Pass 1
         }
-        if ((int)selected_.size() >= P_.B_tri) return selected_;
+        if ((int)selected_.size() >= budget) return selected_;
     }
 
     // Pass 2: fill remaining up to B_tri
     bool progressed = true;
-    while (progressed && (int)selected_.size() < P_.B_tri) {
+    while (progressed && (int)selected_.size() < budget) {
         progressed = false;
         for (EdgeId key : keys) {
             auto& buck = buckets_[key];
@@ -117,10 +151,19 @@ const std::vector<Candidate>& TriangleBucketBatch::select(std::vector<EdgeId>& c
                 if (already_taken_(c)) continue;
                 if (!respect_cap_(c, used_per_vertex)) continue;
                 commit_(c, used_per_vertex);
+                // Cross-batch density: add 1/3 to all three edges of the triangle
+                TBB_on_accept(c.neg_eid,    1.0/3.0);
+                TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
+                TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
+                // Within-batch mask bump on positive edges
+                used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
+                used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
+                TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
+                TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
                 progressed = true;
                 break; // move to next bucket
             }
-            if ((int)selected_.size() >= P_.B_tri) break;
+            if ((int)selected_.size() >= budget) break;
         }
     }
     return selected_;
