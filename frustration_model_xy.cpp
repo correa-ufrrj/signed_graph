@@ -870,6 +870,29 @@ void FrustrationModelXY::NegativeCycleCutGenerator::main(){ // compact signature
 
     auto stream = owner.graph.open_negative_cycle_stream(IS_ROOT /*cover*/);
 
+    // ===== BEGIN: reheat + working weights wiring (separation only) =====
+    // Rebuild salience-aware, nonnegative working weights on E^+ using (x_vals,y_vals).
+    IloNumArray xhat2(env, (IloInt)owner.x.size());
+    IloNumArray yhat2(env, (IloInt)owner.y.size());
+    for (IloInt i = 0; i < xhat2.getSize(); ++i) xhat2[i] = (i < (IloInt)x_vals.size() ? x_vals[i] : 0.0);
+    for (IloInt i = 0; i < yhat2.getSize(); ++i) yhat2[i] = (i < (IloInt)y_vals.size() ? y_vals[i] : 0.0);
+    build_work_weights_(xhat2, yhat2);
+
+    // Build current negative-edge mask under the (switched) signature.
+    std::vector<char> neg_edge_mask(owner.edge_index.size(), 0);
+    for (const auto& kv : owner.edge_index) {
+        const Edge& e = kv.first;
+        auto sit = owner.signs.find(e);
+        if (sit != owner.signs.end() && sit->second.sign < 0) neg_edge_mask[kv.second] = 1;
+    }
+
+    // Seed buckets from the reheat pool: anchors to treat as already covered in this round.
+    std::unordered_set<int> reheated_anchors;
+    reheat_seed_buckets_(reheated_anchors, neg_edge_mask, xhat2, yhat2);
+    // Optionally guard your per-negative-edge enumerators with:
+    // if (reheated_anchors.count(neg_eid)) continue;
+    // ===== END: reheat + working weights wiring =====
+
     auto mix64 = [](uint64_t x){
         x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
         x ^= x >> 27; x *= 0x94d049bb133111ebULL;
