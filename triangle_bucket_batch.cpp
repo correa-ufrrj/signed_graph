@@ -28,7 +28,7 @@
 //
 // that fills c.score_primary, c.score_secondary (and optionally c.viol, c.phi).
 template <class Scorer>
-void build_TriangleBucketBatch::buckets(Scorer&& scorer) {
+void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
     buckets_.clear();
     // Build fast membership for positive adjacency (per u)
     // We'll reuse pos_adj_ directly; to check common neighbors, we
@@ -132,11 +132,11 @@ const std::vector<Candidate>& TriangleBucketBatch::selected() const { return sel
 // Access buckets (read-only)
 const std::unordered_map<EdgeId, std::vector<Candidate>>& TriangleBucketBatch::buckets() const { return buckets_; }
 
-const Params& TriangleBucketBatch::params() const { return P_; }
-Params& params() { return P_; }
+const TriangleBucketBatch::Params& TriangleBucketBatch::params() const { return P_; }
+TriangleBucketBatch::Params& params() { return P_; }
 
 // Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
-static long long TriangleBucketBatch::key_(VertexId a, VertexId b) {
+long long TriangleBucketBatch::key_(VertexId a, VertexId b) {
     if (a > b) std::swap(a, b);
     return ( (static_cast<long long>(a) << 32) ^ static_cast<unsigned long long>(b) );
 }
