@@ -1,38 +1,73 @@
 // ============================================================================
 // File: include/cycle_key.h
-// Why: single source of truth for the switching-invariant, orientation-aware key
+// Purpose: switching-invariant, orientation-agnostic keys for 1-neg cycles
+// Simplified to leverage existing Edge/NegativeCycle types from signed_graph.h
 // ============================================================================
 #pragma once
 #include <vector>
-#include <cstddef>
-#include <functional>
+#include <algorithm>
+#include <cstdint>
+#include "signed_graph.h"   // Edge, NegativeCycle
 
 namespace fmkey {
 
+// Canonicalize an unordered pair (u,v) to (min,max)
+inline std::pair<int,int> mm(int u, int v) {
+    if (u > v) std::swap(u, v);
+    return {u, v};
+}
+
+// A 1-negative-cycle key = (neg edge endpoints) + sorted list of distinct
+// positive edges (each canonicalized as (min,max)).
 struct CycleKey {
-    // Canonical y-index sequence around the cycle (undirected edges, canonical rotation + direction)
-    std::vector<int> y_idx;
-    // Parity/right-hand-side; 0 for 1-neg cycles in your pipeline
-    int rhs = 0;
-    // Whether canonical direction is reversed vs. vertex order used to build the key
-    bool reversed = false;
+    int a = 0, b = 0;                                // neg edge endpoints (min,max)
+    std::vector<std::pair<int,int>> pos;             // sorted, unique (min,max) positive edges
 };
 
-// Stable hashing across processes; keep simple + fast.
+// Construct from a triangle (neg uv, pos uw & wv)
+inline CycleKey make_from_triangle(int u, int v, int w) {
+    CycleKey k; auto ab = mm(u, v); k.a = ab.first; k.b = ab.second;
+    k.pos = { mm(u, w), mm(v, w) };
+    if (k.pos[1] < k.pos[0]) std::swap(k.pos[0], k.pos[1]);
+    return k;
+}
+
+// Construct from a general 1-neg cycle (neg uv + positive path)
+inline CycleKey make_from_cycle(const NegativeCycle& C) {
+    CycleKey k; auto ab = mm(C.neg_edge().first, C.neg_edge().second);
+    k.a = ab.first; k.b = ab.second;
+    k.pos.reserve(C.pos_edges().size());
+    for (auto const& e : C.pos_edges()) k.pos.push_back(mm(e.first, e.second));
+    std::sort(k.pos.begin(), k.pos.end());
+    k.pos.erase(std::unique(k.pos.begin(), k.pos.end()), k.pos.end());
+    return k;
+}
+
+// 64-bit anchor-only key for (u,v) (useful for reheat seed maps)
+inline uint64_t anchor64(int u, int v) {
+    if (u > v) std::swap(u, v);
+    return (static_cast<uint64_t>(static_cast<uint32_t>(u)) << 32) |
+           static_cast<uint32_t>(v);
+}
+
+// Hash & equality so CycleKey can be used in unordered_{set,map}
 struct CycleKeyHash {
-    std::size_t operator()(const CycleKey& k) const noexcept {
-        std::size_t h = static_cast<std::size_t>(k.rhs) * 0x9e3779b97f4a7c15ULL ^ (k.reversed ? 0x85ebca6b : 0xc2b2ae35);
-        for (int v : k.y_idx) {
-            // FNV-1a-ish mix
-            h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+    std::size_t operator()(CycleKey const& k) const noexcept {
+        uint64_t h = (static_cast<uint64_t>(static_cast<uint32_t>(k.a)) << 32)
+                   ^ static_cast<uint32_t>(k.b);
+        for (auto const& p : k.pos) {
+            uint64_t t = (static_cast<uint64_t>(static_cast<uint32_t>(p.first)) << 32)
+                       ^ static_cast<uint32_t>(p.second) ^ 0x9e3779b97f4a7c15ULL;
+            // mix a bit
+            h ^= t; h = (h << 7) ^ (h >> 3);
         }
-        return h;
+        return static_cast<std::size_t>(h);
     }
 };
 
 struct CycleKeyEq {
-    bool operator()(const CycleKey& a, const CycleKey& b) const noexcept {
-        return a.rhs == b.rhs && a.reversed == b.reversed && a.y_idx == b.y_idx;
+    bool operator()(CycleKey const& x, CycleKey const& y) const noexcept {
+        return x.a == y.a && x.b == y.b && x.pos == y.pos;
     }
 };
 

@@ -14,6 +14,16 @@
 #include <algorithm>
 
 #include "triangle_bucket_batch.h"
+#include "cycle_key.h"
+#include "reheat_pool.h"
+
+// Forward declarations (C linkage) for TBB hooks used by TriangleBucketBatch.
+// These are defined with strong linkage in negative_cycle_batch.cpp.
+extern "C" {
+void TBB_on_emit(int, double);
+void TBB_on_accept(int, double);
+int  TBB_budget_override(int);
+}
 
 class NegativeCycleBatch {
 public:
@@ -24,10 +34,17 @@ public:
     int  batches_emitted()      const;
     void set_lp_scores_full_edges(const std::vector<double>& s, double alpha=1.0, double beta=0.3);
 
+    // Access emitted cycle keys (stateless de-dup / reheat wiring)
+    const std::vector<fmkey::CycleKey>& emitted_keys() const { return emitted_keys_; }
+    void clear_emitted_keys() { emitted_keys_.clear(); }
+
+    // Optional: seed a ReheatPool as cycles are accepted
+    void set_reheat_pool(ReheatPool* pool) { reheat_pool_ = pool; }
+
     // Grant the global C hooks friend access to call private internals
-    friend void TBB_on_emit(int, double);
-    friend void TBB_on_accept(int, double);
-    friend int  TBB_budget_override(int);
+    friend void ::TBB_on_emit(int, double);
+    friend void ::TBB_on_accept(int, double);
+    friend int  ::TBB_budget_override(int);
 
 private:
     const SignedGraphForMIP& G_;
@@ -87,6 +104,11 @@ private:
 
     std::vector<int> tri_cap_per_v_; // adaptive (legacy), still used for SP acceptance
 
+    // === Stateless dedup + reheat plumbing ===
+    std::vector<fmkey::CycleKey> emitted_keys_;
+    std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> recent_local_;
+    ReheatPool* reheat_pool_ = nullptr;
+
     inline void bump_cross_batch_(int eid, int cycle_len) {
         if (cycle_len <= 0) return;
         if (eid >= 0 && eid < static_cast<int>(base_pos_.size())) {
@@ -95,7 +117,7 @@ private:
     }
 
     inline bool edge_is_pos(igraph_integer_t eid) const {
-        return G_.switched_weights[eid] > 0.0;
+        return G_.get_switched_weight()[eid] > 0.0;
     }
 
     void build_initial_state_();
@@ -117,12 +139,3 @@ private:
     int    K_sp_per_neg_ = 3;
     double alt_path_bump_ = 1.0; // scaled from med_base_pos_ at build
 };
-
-// --- global bridges implemented in .cpp ---
-// (TriangleBucketBatch links against these)
-// triangle_bucket_batch.h
-extern "C" {
-void TBB_on_emit(int /*edge_id*/, double /*used_density*/);
-void TBB_on_accept(int /*edge_id*/, double /*density*/);
-int  TBB_budget_override(int base);
-}

@@ -27,9 +27,7 @@ int TBB_budget_override(int base) {
 
 } // extern "C"
 
-NegativeCycleBatch SignedGraphForMIP::open_negative_cycle_stream(bool cover, bool use_triangle_order) const {
-    return NegativeCycleBatch(*this, cover, use_triangle_order);
-}
+
 
 NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G, bool cover, bool use_triangle_order)
     : G_(G),
@@ -37,7 +35,7 @@ NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G, bool cover, b
       use_tri_order_(use_triangle_order) {
     if (use_tri_order_) {
         try { neg_tri_vert_ = G_.negative_triangle_count_per_vertex(); }
-        catch(...) { neg_tri_vert_.assign(igraph_vcount(&G_.g), 0); }
+        catch(...) { neg_tri_vert_.assign(G_.vertex_count(), 0); }
     } else {
         neg_tri_vert_.clear();
     }
@@ -79,8 +77,8 @@ void NegativeCycleBatch::set_lp_scores_full_edges(const std::vector<double>& s, 
 }
 
 void NegativeCycleBatch::build_initial_state_() {
-    vcount_ = igraph_vcount(&G_.g);
-    ecount_ = igraph_ecount(&G_.g);
+    vcount_ = G_.vertex_count();
+    ecount_ = G_.edge_count();
 
     base_pos_.assign((size_t)ecount_, 1.0);
     reuse_accum_.assign((size_t)ecount_, 0.0);
@@ -90,8 +88,9 @@ void NegativeCycleBatch::build_initial_state_() {
 
     std::vector<double> pos_bases; pos_bases.reserve((size_t)ecount_);
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        igraph_integer_t u, v; igraph_edge(&G_.g, eid, &u, &v);
-        const double w = G_.switched_weights[eid];
+        const auto se = G_.signs_view()[eid];
+        igraph_integer_t u = se.points.first, v = se.points.second;
+        const double w = G_.get_switched_weight()[eid];
         if (w > 0.0) {
             base_pos_[(size_t)eid] = std::max(1e-12, std::fabs(w));
             pos_bases.push_back(base_pos_[(size_t)eid]);
@@ -127,7 +126,8 @@ void NegativeCycleBatch::build_initial_state_() {
 
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
         if (!edge_is_pos(eid)) continue;
-        igraph_integer_t u, v; igraph_edge(&G_.g, eid, &u, &v);
+        const auto se = G_.signs_view()[eid];
+        igraph_integer_t u = se.points.first, v = se.points.second;
         full2pos_eid_[(size_t)eid] = (igraph_integer_t)pos2full_eid_.size();
         pos2full_eid_.push_back(eid);
         pos_edges.push_back(u); pos_edges.push_back(v);
@@ -190,7 +190,8 @@ void NegativeCycleBatch::build_pos_adj_and_index_(
     pos_adj.assign((size_t)vcount_, {});
     // Map all edges to full-eid (so neg anchors resolve)
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        igraph_integer_t u, v; igraph_edge(&G_.g, eid, &u, &v);
+        const auto se = G_.signs_view()[eid];
+        igraph_integer_t u = se.points.first, v = se.points.second;
         edge_index.emplace(key64_pair((int)u,(int)v), (int)eid);
         // only positive edges go to adjacency
         if (edge_is_pos(eid)) {
@@ -224,6 +225,7 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
     std::vector<NegativeCycle>& out,
     std::vector<int>& covered_neg_eids)
 {
+    const auto edge_idx = G_.edge_index();
     covered_neg_eids.clear();
 
     // Build TriangleBucketBatch inputs
@@ -267,22 +269,35 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
         std::vector<Edge> cyc_path;
         cyc_path.emplace_back(c.u, c.w);
         cyc_path.emplace_back(c.w, c.v);
-        out.emplace_back(Edge{c.u, c.v}, std::move(cyc_path));
-        ++total_found_;
 
-        // Update per-vertex caps & coverage
-        ++tri_used_per_vertex_[c.u];
-        ++tri_used_per_vertex_[c.v];
-        ++tri_used_per_vertex_[c.w];
-        igraph_integer_t neg_eid; igraph_get_eid(&G_.g, &neg_eid, c.u, c.v, /*directed=*/0, /*error=*/1);
-        if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
+        // Stateless in-round dedup: only emit if new
+        fmkey::CycleKey k = fmkey::make_from_triangle(c.u, c.v, c.w);
+        if (recent_local_.insert(k).second) {
+            out.emplace_back(Edge{c.u, c.v}, std::move(cyc_path));
+            emitted_keys_.push_back(k);
+            ++total_found_;
+            // Optional reheat seed
+            if (reheat_pool_) {
+                ReheatItem it; it.cyc_vertices = {c.u, c.w, c.v, c.u}; it.ttl = 3;
+                reheat_pool_->upsert(k, it);
+            }
+            // Update per-vertex caps & coverage
+            ++tri_used_per_vertex_[c.u];
+            ++tri_used_per_vertex_[c.v];
+            ++tri_used_per_vertex_[c.w];
+            igraph_integer_t neg_eid = (igraph_integer_t) edge_idx[Edge{c.u, c.v}];
+            if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
+        }
     }
 
     return !selected.empty();
 }
 
 bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
+    const auto edge_idx = G_.edge_index();
     out.clear();
+    emitted_keys_.clear();
+    recent_local_.clear();
     if (finished_) return false;
 
     using clock = std::chrono::steady_clock;
@@ -306,7 +321,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
     std::unordered_set<int> covered_set(covered_neg_eids.begin(), covered_neg_eids.end());
     std::vector<Edge> neg_edges_uncov; neg_edges_uncov.reserve(neg_edges_.size());
     for (const auto& e_neg : neg_edges_) {
-        igraph_integer_t eid; igraph_get_eid(&G_.g, &eid, e_neg.first, e_neg.second, 0, 1);
+        igraph_integer_t eid = (igraph_integer_t) edge_idx[Edge{e_neg.first, e_neg.second}];
         if (covered_set.find((int)eid) == covered_set.end()) neg_edges_uncov.push_back(e_neg);
     }
 
@@ -334,9 +349,13 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
             std::vector<igraph_integer_t>    path_pos_eids;
             std::vector<igraph_integer_t>    path_full_eids;
             const int nodes_on_path = igraph_vector_int_size(&path);
+            std::vector<int> path_nodes; path_nodes.reserve(nodes_on_path);
             cycle_path_tmp.reserve(nodes_on_path);
             path_pos_eids.reserve(nodes_on_path);
             path_full_eids.reserve(nodes_on_path);
+            for (int i = 0; i < nodes_on_path; ++i) {
+                path_nodes.push_back(VECTOR(path)[i]);
+            }
             for (int i = 1; i < nodes_on_path; ++i) {
                 const int a = VECTOR(path)[i - 1], b = VECTOR(path)[i];
                 cycle_path_tmp.emplace_back(a, b);
@@ -366,9 +385,10 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                 if (nodes_on_path == 3) {
                     igraph_integer_t pe1 = path_pos_eids[0], pe2 = path_pos_eids[1];
                     igraph_integer_t e1  = pos2full_eid_[pe1], e2 = pos2full_eid_[pe2];
-                    igraph_integer_t u1, v1, u2, v2;
-                    igraph_edge(&G_.g, e1, &u1, &v1);
-                    igraph_edge(&G_.g, e2, &u2, &v2);
+                    const auto se1 = G_.signs_view()[e1];
+                    const auto se2 = G_.signs_view()[e2];
+                    igraph_integer_t u1 = se1.points.first, v1 = se1.points.second;
+                    igraph_integer_t u2 = se2.points.first, v2 = se2.points.second;
                     igraph_integer_t w = (u1 == u2 || u1 == v2) ? u1 : v1;
                     if (w == uu || w == vv) w = (u1 == uu || u1 == vv) ? v1 : u1;
 
@@ -388,16 +408,31 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                 const int L = nodes_on_path;
                 for (auto feid : path_full_eids) bump_cross_batch_(feid, L);
 
-                out.emplace_back(e_neg, std::move(cycle_path_tmp));
-                ++total_found_; ++cycles_emitted_now; ++accepted_here;
+                // Build key for dedup
+                fmkey::CycleKey k; { k.a = std::min(uu, vv); k.b = std::max(uu, vv);
+                    k.pos.reserve(cycle_path_tmp.size());
+                    for (auto const& e : cycle_path_tmp) { auto p = fmkey::mm(e.first, e.second); k.pos.push_back(p);} 
+                    std::sort(k.pos.begin(), k.pos.end()); k.pos.erase(std::unique(k.pos.begin(), k.pos.end()), k.pos.end()); }
+
+                if (recent_local_.insert(k).second) {
+                    out.emplace_back(e_neg, std::move(cycle_path_tmp));
+                    emitted_keys_.push_back(k);
+                    ++total_found_; ++cycles_emitted_now; ++accepted_here;
+
+                    // Reheat seed: ring vertices (close path)
+                    if (reheat_pool_) {
+                        ReheatItem it; it.cyc_vertices = path_nodes; if (!it.cyc_vertices.empty()) it.cyc_vertices.push_back(it.cyc_vertices.front()); it.ttl = 3;
+                        reheat_pool_->upsert(k, it);
+                    }
 
                 igraph_integer_t neg_eid;
-                igraph_get_eid(&G_.g, &neg_eid, uu, vv, 0, 1);
+                neg_eid = (igraph_integer_t) edge_idx[Edge{uu, vv}];
                 if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
 
                 // Soft mask bumps to encourage alternative path next rep
                 for (auto peid : path_pos_eids) VECTOR(saved_weights_pos_)[peid] += alt_path_bump_;
-                ms_emit += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_emit0).count();
+                    ms_emit += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_emit0).count();
+                }
             } else {
                 // Duplicate path -> bigger bump to break ties
                 for (auto peid : path_pos_eids) VECTOR(saved_weights_pos_)[peid] += 2.0 * alt_path_bump_;
