@@ -4,6 +4,7 @@
 #include <limits>
 #include <cmath>
 #include "triangle_bucket_batch.h"
+#include <algorithm>
 
 // TriangleBucketBatch → driver hook bridge (strong defs override TBB weak ones)
 namespace { TriangleCyclePipeline* g_tbb_active = nullptr; }
@@ -280,7 +281,62 @@ void TriangleCyclePipeline::sp_stage_() {
 }
 
 void TriangleCyclePipeline::commit_stage_() {
-    // No-op for step 3. Persistent ω/H updates and pool bookkeeping arrive in steps 6–7.
+    // Step 6: Persistent updates for ω, H, and pool_count.
+    // We compute per-edge acceptance density from the triangles selected
+    // in this round (and later, cycles), then apply:
+    //   pool_count[e] += acc[e]
+    //   ω[e] <- clamp( ω[e] + β_sel * acc[e], [eps, ω_max] )
+    //   H[e] <- δ·H[e] + ρ·acc[e] + κ·max(0, emit[e] - acc[e])
+
+    const int m = G_.edge_count();
+    if (m <= 0) return;
+
+    // Ensure persistent arrays are sized (defensive; also done at round start)
+    S_.init_sizes_if_needed(G_);
+
+    // 1) Build acceptance density over FULL edges from triangles picked this round.
+    std::vector<double> acc_full(m, 0.0);
+    for (const auto& t : tri_selected_) {
+        // For a 1-neg triangle, distribute unit density evenly across its 3 edges.
+        // This matches the per-edge density used by selection and avoids bias.
+        const double d = 1.0 / 3.0;
+        if (t.neg_eid     >= 0 && t.neg_eid     < m) acc_full[t.neg_eid]     += d;
+        if (t.pos_eid_uw  >= 0 && t.pos_eid_uw  < m) acc_full[t.pos_eid_uw]  += d;
+        if (t.pos_eid_wv  >= 0 && t.pos_eid_wv  < m) acc_full[t.pos_eid_wv]  += d;
+    }
+
+    // (Future) When SP is wired, add its accepted cycle densities here as well.
+
+    // 2) Build emission density over FULL edges from within-batch usage on E⁺.
+    std::vector<double> emit_full(m, 0.0);
+    for (int pid = 0; pid < (int)round_.used_in_batch_pos.size(); ++pid) {
+        int eid = (pid < (int)Gt_.pos2full.size() ? Gt_.pos2full[pid] : -1);
+        if (eid >= 0 && eid < m) emit_full[eid] = round_.used_in_batch_pos[pid];
+    }
+
+    // 3) Apply persistent updates element-wise.
+    const double eps = std::max(1e-12, C_.omega_eps);
+    const double wmax = (C_.omega_max > 0.0 ? C_.omega_max : std::numeric_limits<double>::infinity());
+
+    for (int e = 0; e < m; ++e) {
+        const double acc  = acc_full[e];
+        const double emit = emit_full[e];
+        const double rej  = (emit > acc ? (emit - acc) : 0.0);
+
+        // pool_count accumulates only ACCEPTED density
+        S_.pool_count[e] += acc;
+
+        // ω drift toward discouraging re-use (caps apply)
+        double w = S_.omega[e] + C_.beta_sel * acc;
+        if (w < eps) w = eps;
+        if (w > wmax) w = wmax;
+        S_.omega[e] = w;
+
+        // Repulsion EMA ledger H
+        double H_new = S_.ema_delta * S_.H[e] + S_.ema_rho * acc + S_.ema_kappa * rej;
+        if (!std::isfinite(H_new)) H_new = S_.H[e];
+        S_.H[e] = H_new;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────

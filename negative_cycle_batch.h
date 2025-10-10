@@ -41,6 +41,14 @@ public:
     // Optional: seed a ReheatPool as cycles are accepted
     void set_reheat_pool(ReheatPool* pool) { reheat_pool_ = pool; }
 
+    // === Usage density export (for persistent updates) ===
+    // Resets within-batch usage counters on the positive-edge graph.
+    void reset_usage_counters();
+    // Read-only view of per-positive-edge usage density accumulated in this batch.
+    const std::vector<double>& pos_usage_density() const { return used_in_batch_pos_; }
+    // Accumulate the pos-graph usage density into a full-edge vector (dst is resized if needed).
+    void accumulate_pos_usage_to_full(std::vector<double>& dst, double scale = 1.0) const;
+
     // Grant the global C hooks friend access to call private internals
     friend void ::TBB_on_emit(int, double);
     friend void ::TBB_on_accept(int, double);
@@ -94,6 +102,9 @@ private:
     // Working weights (pos-only) for Dijkstra
     igraph_vector_t saved_weights_pos_{};
     bool saved_weights_pos_init_ = false;
+
+    // Within-batch usage density on positive edges (pos-graph indexing)
+    std::vector<double> used_in_batch_pos_;
 
     // Scoring/LP blending (carried across batches)
     int    K_tri_per_neg_ = 3;

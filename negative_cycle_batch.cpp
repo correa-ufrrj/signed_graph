@@ -61,6 +61,8 @@ void NegativeCycleBatch::build_mask_for_batch_() {
         for (long i = 0; i < (long)ecount_; ++i) VECTOR(saved_weights_)[i] = 0.0;
     }
     std::fill(reuse_accum_.begin(), reuse_accum_.end(), 0.0);
+    // reset within-batch usage counters for this batch
+    used_in_batch_pos_.assign(pos2full_eid_.size(), 0.0);
     alt_path_bump_ = med_base_pos_; // keep your prior behavior
 }
 
@@ -214,6 +216,8 @@ void NegativeCycleBatch::on_emit_(int full_eid, double used_density) {
     // Tiny bump proportional to median and used_density
     const double bump = 0.05 * med_base_pos_ * std::max(0.0, used_density);
     VECTOR(saved_weights_pos_)[pe] = std::max(1e-12, VECTOR(saved_weights_pos_)[pe] + bump);
+    // Track usage density for persistent (ω/H) updates at commit time
+    used_in_batch_pos_[(size_t)pe] += std::max(0.0, used_density);
 }
 
 void NegativeCycleBatch::on_accept_(int full_eid, double /*density*/) {
@@ -366,6 +370,8 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                     path_full_eids.push_back(feid);
                 }
             }
+            // Count usage on this shortest path for persistent repulsion
+            for (auto peid : path_pos_eids) used_in_batch_pos_[(size_t)peid] += 1.0;
 
             const auto t_chk0 = clock::now();
             bool valid = true;
@@ -470,4 +476,17 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
               << std::endl;
 
     return !out.empty();
+}
+
+// Usage density helpers
+void NegativeCycleBatch::reset_usage_counters() {
+    used_in_batch_pos_.assign(pos2full_eid_.size(), 0.0);
+}
+
+void NegativeCycleBatch::accumulate_pos_usage_to_full(std::vector<double>& dst, double scale) const {
+    if ((size_t)dst.size() < (size_t)ecount_) dst.resize((size_t)ecount_, 0.0);
+    for (size_t pe = 0; pe < pos2full_eid_.size(); ++pe) {
+        igraph_integer_t fe = pos2full_eid_[pe];
+        if (fe >= 0) dst[(size_t)fe] += scale * used_in_batch_pos_[pe];
+    }
 }
