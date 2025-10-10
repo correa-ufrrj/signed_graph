@@ -4,49 +4,17 @@
 // Weak, overridable integration hooks:
 extern "C" {
 #if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak))
+// Weak, overridable defaults for GCC/Clang
+__attribute__((weak)) void TBB_on_emit(int /*edge_id*/, double /*used_density*/) {}
+__attribute__((weak)) void TBB_on_accept(int /*edge_id*/, double /*density*/) {}
+__attribute__((weak)) int  TBB_budget_override(int base) { return base; }
+#else
+// On MSVC (or other compilers), do NOT provide defaults here.
+// The strong definitions must come from the pipeline.
 #endif
-void TBB_on_emit(int /*edge_id*/, double /*used_density*/) {}
-
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak))
-#endif
-void TBB_on_accept(int /*edge_id*/, double /*density*/) {}
-
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((weak))
-#endif
-int TBB_budget_override(int base) { return base; }
 }
 
 
-// Example usage (to be wired later):
-//
-//   TriangleBucketBatch::PosAdj pos_adj = ...;        // G^+_σ
-//   TriangleBucketBatch::EdgeIndex edge_idx = ...;    // (u,v)->eid
-//   std::vector<std::pair<int,int>> neg_edges = ...;        // anchors
-//   TriangleBucketBatch::Params P{K,B,cap};
-//   TriangleBucketBatch stream(neg_edges, pos_adj, edge_idx, P);
-//
-//   auto scorer = [&](TriangleBucketBatch::Candidate& c){
-//       // fill c.score_primary, c.score_secondary, optionally c.viol/c.phi
-//   };
-//   stream.build_buckets(scorer);
-//   std::vector<int> covered;
-//   const auto& chosen = stream.select(covered);
-//
-//
-// Hook to compute the primary & secondary score and optional cached metrics.
-// The caller supplies a functor:
-//
-//    void scorer(Candidate& c)
-//
-// that fills c.score_primary, c.score_secondary (and optionally c.viol, c.phi).
-//
-// Two-pass selection:
-//  - Pass 1: secure at most one strong triangle per bucket (respect per-vertex caps)
-//  - Pass 2: fill remaining candidates, cycling buckets, up to B_tri (respect caps)
-//
 // Returns indices into internal 'selected_' vector; also outputs the set of
 // covered anchors (neg edge ids) in 'covered_neg_out'.
 const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_neg_out) {
@@ -152,18 +120,25 @@ void TriangleBucketBatch::ensure_sorted_adjacency_() {
 }
 
 bool TriangleBucketBatch::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
-    auto ok = [&](VertexId x){ return used[x] < P_.cap_per_vertex; };
-    return ok(c.u) && ok(c.v) && ok(c.w);
+    if (P_.cap_per_vertex <= 0) return true;
+    if (c.u < 0 || c.v < 0 || c.w < 0) return false;
+    if (c.u >= (int)used.size() || c.v >= (int)used.size() || c.w >= (int)used.size()) return false;
+    if (used[c.u] >= P_.cap_per_vertex) return false;
+    if (used[c.v] >= P_.cap_per_vertex) return false;
+    if (used[c.w] >= P_.cap_per_vertex) return false;
+    return true;
 }
 
-bool TriangleBucketBatch::already_taken_(const TriangleBucketBatch::Candidate& c) const {
-    // cheap set check by (neg_eid, w) would suffice, but keep full triplet
-    auto key = std::tuple<VertexId,VertexId,VertexId>(c.u,c.w,c.v);
+bool TriangleBucketBatch::already_taken_(const Candidate& c) const {
+    // We store exactly the oriented triple (u,w,v); buckets are keyed by (u,v) anchor anyway
+    std::tuple<int,int,int> key{c.u, c.w, c.v};
     return taken_.find(key) != taken_.end();
 }
 
-void TriangleBucketBatch::commit_(const TriangleBucketBatch::Candidate& c, std::vector<int>& used) {
-    used[c.u]++; used[c.v]++; used[c.w]++;
+void TriangleBucketBatch::commit_(const Candidate& c, std::vector<int>& used) {
     selected_.push_back(c);
-    taken_.insert(std::tuple<VertexId,VertexId,VertexId>(c.u,c.w,c.v));
+    used[c.u] += 1;
+    used[c.v] += 1;
+    used[c.w] += 1;
+    taken_.insert(std::tuple<int,int,int>{c.u, c.w, c.v});
 }

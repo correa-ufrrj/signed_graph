@@ -95,6 +95,17 @@ SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOpti
 }
 
 std::optional<std::shared_ptr<const std::vector<int>>>
+SignedGraphForMIP::fractional_greedy_switching(const std::vector<double>& x,
+                                               const std::vector<double>& y) {
+    SignedGraph::GreedyKickOptions opts;
+    opts.frac_x = &x;
+    opts.frac_y = &y;
+    auto sp = std::make_shared<const std::vector<int>>(
+        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
+    return sp;
+}
+
+std::optional<std::shared_ptr<const std::vector<int>>>
 SignedGraphForMIP::fractional_greedy_switching() {
     SignedGraph::GreedyKickOptions opts;
     auto sp = std::make_shared<const std::vector<int>>(

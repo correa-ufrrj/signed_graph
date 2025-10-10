@@ -283,6 +283,11 @@ public:
     const SignedEdgesView signs_view() const { return SignedEdgesView(&g, &weights); }
     const WeightsView weights_view() const { return WeightsView(&g, &weights); }
     const EdgeIndexesView edge_index() const;
+    // Original & switched edge weights (eid-indexed)
+    const std::vector<double>& get_weights() const { return weights; }
+    const std::vector<double>& get_switched_weight() const { return switched_weights; }
+    // Convenience: key/value iterator view over the current switched signature
+    const WeightsView switched_weights_view() const { return WeightsView(&g, &switched_weights); }
     const std::vector<double>& plus_degrees_view() const;
     const std::vector<double>& minus_degrees_view() const;
     const long double max_degree_vertex() const;

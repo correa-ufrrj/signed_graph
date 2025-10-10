@@ -35,6 +35,8 @@ public:
     const std::vector<int> greedy_switching();
     std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching(const SignedGraph::GreedyKickOptions& opts);
     std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching();
+    std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching(const std::vector<double>& x,
+                                                                                       const std::vector<double>& y);
 
     // Public “finder” APIs (now wrappers over the stream)
     std::vector<NegativeCycle> find_switched_lower_bound(bool cover = false);
