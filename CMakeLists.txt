@@ -24,8 +24,8 @@ include_directories(
 # Gather source files
 set(SOURCES
 #    main.cpp
-#    frustration_model.cpp
-#    frustration_model_xy.cpp
+    frustration_model.cpp
+    frustration_model_xy.cpp
 #    frustration_model_x.cpp
 #    modularity_model.cpp
 #    triangle_bucket_batch.cpp

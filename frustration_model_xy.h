@@ -54,11 +54,11 @@ public:
     const TriangleCyclePipeline& driver() const;
 
     // Register exactly one separation callback, per the selected mode.
-//  - TrianglesOnly : NegativeTriangleCutGenerator (TBB-only)
-//  - CyclesOnly    : NegativeCycleCutGenerator (SP-only)
-//  - Pipeline      : TriangleCycleCutGenerator (triangle→SP→commit)
-void attach_separation_callbacks(IloCplex& cplex,
-                                 SeparationMode mode = SeparationMode::Pipeline);
+	//  - TrianglesOnly : NegativeTriangleCutGenerator (TBB-only)
+	//  - CyclesOnly    : NegativeCycleCutGenerator (SP-only)
+	//  - Pipeline      : TriangleCycleCutGenerator (triangle→SP→commit)
+	void attach_separation_callbacks(IloCplex& cplex,
+	                                 SeparationMode mode = SeparationMode::Pipeline);
 
     // Phase policy for callbacks (default: Fractional phase enabled)
     void set_fractional_phase_enabled(bool on) { fractional_phase_enabled_ = on; }
@@ -94,10 +94,11 @@ private:
     std::vector<IloBoolVar> x;   // vertex binaries
     std::vector<IloNumVar>  y;   // edge binaries (undirected)
 
-    // Whether the last round added triangle cuts (used by ConditionalCycleCutGenerator)
-    bool 
-    // Global policy for callbacks: Fractional vs Build phase
-    bool fractional_phase_enabled_ = true;
+	// Whether the last round added triangle cuts (kept for compatibility)
+	bool triangle_cut_added_last_round = false;
+	
+	// Global policy for callbacks: Fractional vs Build phase
+	bool fractional_phase_enabled_ = true;
 
     // (Moved) Reheat + de-dup state now lives in SeparationPersistent (sep_state_):
 //   - sep_state_.P_reheat
@@ -131,7 +132,7 @@ private:
         const IloNumArray& yhat);
 
     // ============================ Cut builders ===============================
-	IloRange generate_cycle_cut_standard(IloEnv& env, const std::vector<Edge>& all_edges);
+	IloRange generate_cycle_cut_standard(IloEnv& env, const std::vector<Edge>& all_edges) const;
 	std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) override;
 	std::vector<std::pair<IloRange, std::string>> generate_positive_triangle_cuts(IloEnv& env, const std::vector<Edge>& all_edges);
 
