@@ -5,20 +5,41 @@
 #include <cmath>
 #include "triangle_bucket_batch.h"
 #include <algorithm>
-
-// TriangleBucketBatch → driver hook bridge (strong defs override TBB weak ones)
-namespace { TriangleCyclePipeline* g_tbb_active = nullptr; }
+// TriangleBucketBatch → generic hook bridge (single strong defs, thread-local)
+namespace {
+struct TBB_VTable {
+    void* ctx{nullptr};
+    void (*emit)(void*, int, double){nullptr};
+    void (*accept)(void*, int, double){nullptr};
+    int  (*budget)(void*, int){nullptr};
+};
+static thread_local TBB_VTable g_tbb_vt{};
+}
 extern "C" {
+// Called by TriangleBucketBatch during enumeration/selection
 void TBB_on_emit(int edge_id, double used_density) {
-    if (g_tbb_active) g_tbb_active->on_emit_(edge_id, used_density);
+    if (g_tbb_vt.emit) g_tbb_vt.emit(g_tbb_vt.ctx, edge_id, used_density);
 }
 void TBB_on_accept(int edge_id, double density) {
-    if (g_tbb_active) g_tbb_active->on_accept_(edge_id, density);
+    if (g_tbb_vt.accept) g_tbb_vt.accept(g_tbb_vt.ctx, edge_id, density);
 }
 int TBB_budget_override(int base) {
-    return g_tbb_active ? g_tbb_active->override_budget_(base) : base;
+    return g_tbb_vt.budget ? g_tbb_vt.budget(g_tbb_vt.ctx, base) : base;
 }
+// Registration API for callers (pipeline, NCB, etc.)
+void TBB_set_active(void* ctx,
+                    void (*emit)(void*, int, double),
+                    void (*accept)(void*, int, double),
+                    int  (*budget)(void*, int)) {
+    g_tbb_vt.ctx    = ctx;
+    g_tbb_vt.emit   = emit;
+    g_tbb_vt.accept = accept;
+    g_tbb_vt.budget = budget;
 }
+void TBB_clear_active() {
+    g_tbb_vt = TBB_VTable{};
+}
+} // extern "C"
 
 // ─────────────────────────────────────────────────────────────
 // TriangleCyclePipeline — step 1: scaffolding only (no behavior change)
@@ -252,11 +273,20 @@ void TriangleCyclePipeline::triangle_stage_() {
     // Build buckets (pure 1-neg triangles on G^+)
     tbb.build_buckets(scorer);
 
-    // Selection with hook wiring
-    g_tbb_active = this;
+    // Selection with hook wiring (register → select → clear)
+    auto emit_cb = [](void* ctx, int eid, double d) {
+        static_cast<TriangleCyclePipeline*>(ctx)->on_emit_(eid, d);
+    };
+    auto accept_cb = [](void* ctx, int eid, double d) {
+        static_cast<TriangleCyclePipeline*>(ctx)->on_accept_(eid, d);
+    };
+    auto budget_cb = [](void* ctx, int base) -> int {
+        return static_cast<TriangleCyclePipeline*>(ctx)->override_budget_(base);
+    };
+    TBB_set_active(static_cast<void*>(this), emit_cb, accept_cb, budget_cb);
     std::vector<int> covered; // full eids of negative anchors with nonempty buckets
     const auto& sel = tbb.select(covered);
-    g_tbb_active = nullptr;
+    TBB_clear_active();
 
     // Persist outputs in round storage
     covered_neg_eids_.assign(covered.begin(), covered.end());

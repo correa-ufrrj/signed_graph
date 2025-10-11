@@ -6,26 +6,24 @@ static inline long long key64_pair(int a, int b) {
     return (static_cast<long long>(static_cast<uint32_t>(a)) << 32) |
            static_cast<uint32_t>(b);
 }
-
-// Active stream for triangle-stage callbacks (thread-local, safe for parallel root/node separation)
-static thread_local NegativeCycleBatch* g_tbb_active = nullptr;
-
-// Strong definitions override weak ones in triangle_bucket_batch.cpp
+// Use centralized TBB bridge (defined in separation_pipeline.cpp)
 extern "C" {
-
-void TBB_on_emit(int edge_id, double used_density) {
-    if (g_tbb_active) g_tbb_active->on_emit_(edge_id, used_density);
+void TBB_set_active(void* ctx,
+                    void (*emit)(void*, int, double),
+                    void (*accept)(void*, int, double),
+                    int  (*budget)(void*, int));
+void TBB_clear_active();
 }
-
-void TBB_on_accept(int edge_id, double density) {
-    if (g_tbb_active) g_tbb_active->on_accept_(edge_id, density);
+// C-callable wrappers that dispatch into this instance
+static void ncb_emit(void* ctx, int eid, double used_density) {
+    static_cast<NegativeCycleBatch*>(ctx)->on_emit_(eid, used_density);
 }
-
-int TBB_budget_override(int base) {
-    return g_tbb_active ? g_tbb_active->override_budget_(base) : base;
+static void ncb_accept(void* ctx, int eid, double density) {
+    static_cast<NegativeCycleBatch*>(ctx)->on_accept_(eid, density);
 }
-
-} // extern "C"
+static int ncb_budget(void* ctx, int base) {
+    return static_cast<NegativeCycleBatch*>(ctx)->override_budget_(base);
+}
 
 
 
@@ -263,10 +261,9 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
 
     // Build buckets and select with active bridges
     tbb.build_buckets(scorer);
-    NegativeCycleBatch* prev = g_tbb_active;
-    g_tbb_active = this;
+    TBB_set_active(static_cast<void*>(this), &ncb_emit, &ncb_accept, &ncb_budget);
     const auto& selected = tbb.select(covered_neg_eids);
-    g_tbb_active = prev;
+    TBB_clear_active();
 
     // Emit accepted triangles as NegativeCycle (two positive edges path)
     for (const auto& c : selected) {
