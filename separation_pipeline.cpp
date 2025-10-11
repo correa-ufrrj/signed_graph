@@ -39,7 +39,7 @@ struct TBBHookScope {
     }
 };
 
-// SP stage: stash only the count here (no persistent updates in Round 4)
+// SP stage: stash only the count here (no persistent updates in Round 4/5)
 static thread_local int g_sp_cycles_accepted = 0;
 
 } // namespace
@@ -71,7 +71,7 @@ void TBB_clear_active() {
 } // extern "C"
 
 // ─────────────────────────────────────────────────────────────
-// TriangleCyclePipeline — Round-4 driver (no LP guidance; no ω/H/pool updates)
+// TriangleCyclePipeline — driver
 // ─────────────────────────────────────────────────────────────
 
 TriangleCyclePipeline::TriangleCyclePipeline(SignedGraphForMIP& G,
@@ -79,7 +79,7 @@ TriangleCyclePipeline::TriangleCyclePipeline(SignedGraphForMIP& G,
                                              SeparationConfig cfg)
     : G_(G), S_(persistent), C_(cfg)
 {
-    // Ensure persistent edge-aligned arrays are sized; we won't mutate them in Round 4.
+    // Ensure persistent edge-aligned arrays are sized
     S_.init_sizes_if_needed(G_);
     rebuild_pos_maps();
 }
@@ -127,10 +127,10 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
     round_.selected_count_full.assign(m, 0.0);
     g_sp_cycles_accepted = 0;
 
-    // === 1) Choose switching s and apply it (no LP guidance yet; λ_LP handled as 0) ===
+    // === 1) Choose switching s and apply it ===
     G_.restore_switched_sign();
     if (phase == Phase::Fractional && x_hat && y_hat) {
-        // Still load salience if available; λ_LP will be 0 so it won't affect ω′ yet.
+        // Load salience if available (λ_LP blending is handled in weights)
         (void)G_.weighting_from_fractional(*x_hat, *y_hat);
     }
     auto s = G_.greedy_switching();
@@ -139,10 +139,10 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
     // === 2) Rebuild positive-subgraph maps under the new switching ===
     rebuild_pos_maps();
 
-    // === 3) Build salience (FULL-edge array). λ_LP is effectively 0 in Round 4 ===
+    // === 3) Build salience (FULL-edge array) ===
     build_salience_(x_hat, y_hat);
 
-    // === 4) Build working weights ω′ on E⁺ (λ_LP currently 0.0) ===
+    // === 4) Build working weights ω′ on E⁺ ===
     build_omega_prime_pos_();
 
     // === Run stages ===
@@ -150,13 +150,13 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
     triangle_stage_();
     sp_stage_();
 
-    // === Commit: Round-4 only returns counts/keys; no persistent updates ===
+    // === Commit persistent updates (Round 6) ===
     commit_stage_();
 
     Result R{};
     R.triangles_accepted = (int)tri_selected_.size();
     R.cycles_accepted    = g_sp_cycles_accepted;
-    // Accepted keys will be assembled in later rounds when cut materialization is wired here.
+    // Accepted_keys to be assembled in later steps when materialization is wired here.
     return R;
 }
 
@@ -211,7 +211,7 @@ void TriangleCyclePipeline::build_omega_prime_pos_()
 
         double base = (eid >= 0 && eid < (int)omega.size()) ? omega[eid] : 1.0;
         double rep  = (eid >= 0 && eid < (int)H.size())     ? C_.ranking.lambda_hist * std::log1p(std::max(0.0, H[eid])) : 0.0;
-        double lp   = (eid >= 0 && eid < (int)sal.size())   ? C_.ranking.lambda_LP   * sal[eid] : 0.0; // λLP unused if 0
+        double lp   = (eid >= 0 && eid < (int)sal.size())   ? C_.ranking.lambda_LP   * sal[eid] : 0.0;
 
         double w = base + rep - lp;
         if (w < eps) w = eps;
@@ -221,7 +221,7 @@ void TriangleCyclePipeline::build_omega_prime_pos_()
 }
 
 void TriangleCyclePipeline::pre_enumeration_reheat_() {
-    // Round 4: no-op (reheat arrives later).
+    // Round 6: still no-op (reheat wiring comes later).
 }
 
 void TriangleCyclePipeline::triangle_stage_() {
@@ -318,7 +318,6 @@ void TriangleCyclePipeline::triangle_stage_() {
 
 void TriangleCyclePipeline::sp_stage_() {
     // === Shortest-path cycle enumeration on uncovered anchors (NCB) ===
-    // Round 4: we only collect counts; NCB manages its own TBB hook scope internally.
     g_sp_cycles_accepted = 0;
 
     NegativeCycleBatch ncb(G_, /*cover=*/false, /*use_triangle_order=*/false, C_.to_ncb_params());
@@ -326,7 +325,7 @@ void TriangleCyclePipeline::sp_stage_() {
     std::vector<NegativeCycle> batch;
     while (ncb.next(batch)) {
         g_sp_cycles_accepted += (int)batch.size();
-        // (Round 4 leaves usage densities/persistent drift OFF)
+        // (Round 6: persistent drift is handled in commit_stage_ via round_ arrays)
         batch.clear();
     }
 
@@ -334,8 +333,79 @@ void TriangleCyclePipeline::sp_stage_() {
 }
 
 void TriangleCyclePipeline::commit_stage_() {
-    // Round 4: produce result vectors only (the Result is assembled in run_round()).
-    // No persistent updates to S_.omega / S_.H / S_.pool_count here.
+    // ── Step 6: Persistent updates (ω, H via EMA, pool_count) ───────────
+    const int m = G_.edge_count();
+    S_.init_sizes_if_needed(G_);
+
+    // Ensure round arrays have size m
+    if ((int)round_.selected_count_full.size() != m)
+        round_.selected_count_full.assign(m, 0.0);
+    if ((int)S_.omega.size() != m)      S_.omega.resize(m, 1.0);
+    if ((int)S_.H.size() != m)          S_.H.resize(m, 0.0);
+    if ((int)S_.pool_count.size() != m) S_.pool_count.resize(m, 0.0);
+
+    const double beta_sel = C_.weights.beta_sel;
+    const double eps      = std::max(1e-12, C_.weights.omega_eps);
+    const double w_cap    = (C_.weights.omega_max > 0.0 ? C_.weights.omega_max
+                                                        : std::numeric_limits<double>::infinity());
+
+    const double delta = S_.ema_delta;
+    const double rho   = S_.ema_rho;
+    const double kappa = S_.ema_kappa;
+
+    // (A) ω drift across rounds using accepted density
+    for (int eid = 0; eid < m; ++eid) {
+        double inc = round_.selected_count_full[eid];
+        if (inc != 0.0) {
+            double w = S_.omega[eid] + beta_sel * inc;
+            if (w < eps) w = eps;
+            if (w > w_cap) w = w_cap;
+            S_.omega[eid] = w;
+        } else {
+            // keep ω within clamps
+            if (S_.omega[eid] < eps) S_.omega[eid] = eps;
+            if (S_.omega[eid] > w_cap) S_.omega[eid] = w_cap;
+        }
+    }
+
+    // (B) H EMA: H ← δ·H + ρ·accepted + κ·(emitted−accepted)_pos
+    // Start with decay
+    std::vector<double> Hnew = S_.H;
+    for (double& v : Hnew) v *= delta;
+
+    // + ρ·accepted over ALL edges (neg & pos)
+    for (int eid = 0; eid < m; ++eid) {
+        double acc = round_.selected_count_full[eid];
+        if (acc != 0.0) Hnew[eid] += rho * acc;
+    }
+
+    // Compute (emitted − accepted) on POS edges via pos mapping
+    if (Gt_.m_pos > 0 && !round_.used_in_batch_pos.empty()) {
+        // Map accepted FULL-edge densities to POS indices
+        std::vector<double> acc_pos(Gt_.m_pos, 0.0);
+        for (int pid = 0; pid < Gt_.m_pos; ++pid) {
+            int eid = Gt_.pos2full[pid];
+            if (eid >= 0 && eid < m) acc_pos[pid] = round_.selected_count_full[eid];
+        }
+        for (int pid = 0; pid < Gt_.m_pos; ++pid) {
+            double emitted  = (pid < (int)round_.used_in_batch_pos.size()) ? round_.used_in_batch_pos[pid] : 0.0;
+            double accepted = acc_pos[pid];
+            double rejected = emitted - accepted;
+            if (rejected < 0.0) rejected = 0.0;
+            int eid = Gt_.pos2full[pid];
+            if (eid >= 0 && eid < m) Hnew[eid] += kappa * rejected;
+        }
+    }
+    S_.H.swap(Hnew);
+
+    // (C) pool_count: accumulate accepted density on edges of accepted cuts
+    for (int eid = 0; eid < m; ++eid) {
+        double inc = round_.selected_count_full[eid];
+        if (inc != 0.0) S_.pool_count[eid] += inc;
+    }
+
+    // NOTE: Stateless de-dup and reheat remain in SeparationPersistent and are
+    // handled elsewhere. No additional reheat behavior is introduced here.
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -346,7 +416,7 @@ void TriangleCyclePipeline::on_emit_(int full_eid, double used_density) {
     const int pid = Gt_.full2pos[full_eid];
     if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return;
     round_.used_in_batch_pos[pid] = used_density;
-    // ω′ ← ω′ + β_emit · used_density (clamped) — this is a *working* (within-round) update
+    // ω′ ← ω′ + β_emit · used_density (clamped) — working (within-round) update
     double w = round_.omega_prime_pos[pid] + C_.weights.beta_emit * used_density;
     if (w < C_.weights.omega_eps) w = C_.weights.omega_eps;
     if (C_.weights.omega_max > 0.0 && w > C_.weights.omega_max) w = C_.weights.omega_max;
@@ -355,12 +425,12 @@ void TriangleCyclePipeline::on_emit_(int full_eid, double used_density) {
 
 void TriangleCyclePipeline::on_accept_(int full_eid, double density) {
     if (full_eid < 0 || full_eid >= (int)round_.selected_count_full.size()) return;
-    // Per-round density counter; persistent drift is disabled in Round 4
+    // Per-round density counter (∑ 1/|C| for edges in accepted cuts)
     round_.selected_count_full[full_eid] += density;
 }
 
 int TriangleCyclePipeline::override_budget_(int base) const {
-    // Pass-through in Round 4; annealing may change this later.
+    // Pass-through for now; annealing may adjust this later.
     return base;
 }
 
