@@ -36,10 +36,15 @@ public:
         double cross_batch_penalty_scale = 3.0; // drift base_pos_ when cycles are accepted
         TriangleBucketBatch::Params tbb{}; // pass-through for the internal triangle stage
     };
-    explicit NegativeCycleBatch(const SignedGraphForMIP& G,
-                                bool cover,
-                                bool use_triangle_order = false,
-                                Params p = Params{});
+	// negative_cycle_batch.h  (only the constructor declarations shown here)
+	explicit NegativeCycleBatch(const SignedGraphForMIP& G,
+	                            bool cover,
+	                            bool use_triangle_order = false);
+	
+	explicit NegativeCycleBatch(const SignedGraphForMIP& G,
+	                            bool cover,
+	                            bool use_triangle_order,
+	                            Params p);
     bool next(std::vector<NegativeCycle>& out);
 
     void set_params(const Params& p) { P_ = p; }
@@ -58,6 +63,9 @@ public:
     friend void ::TBB_on_emit(int, double);
     friend void ::TBB_on_accept(int, double);
     friend int  ::TBB_budget_override(int);
+	friend void ncb_emit(void*, int, double);
+	friend void ncb_accept(void*, int, double);
+	friend int  ncb_budget(void*, int);
 
 private:
     Params P_{};
