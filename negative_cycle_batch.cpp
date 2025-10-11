@@ -1,9 +1,10 @@
+// negative_cycle_batch.cpp
 #include "negative_cycle_batch.h"
 #include <unordered_set>
 #include <algorithm>
 #include <chrono>
 
-// Use centralized TBB bridge (defined in separation_pipeline.cpp)
+// Use centralized TBB bridge (strongly defined in separation_pipeline.cpp)
 extern "C" {
 void TBB_set_active(void* ctx,
                     void (*emit)(void*, int, double),
@@ -13,7 +14,7 @@ void TBB_clear_active();
 }
 
 // ---------- C-callable wrappers that dispatch into this instance ----------
-// NOTE: these have external linkage (no 'static'); the class declares them as friends.
+// NOTE: external linkage; the class declares them as friends.
 void ncb_emit(void* ctx, int eid, double used_density) {
     static_cast<NegativeCycleBatch*>(ctx)->on_emit_(eid, used_density);
 }
@@ -23,6 +24,19 @@ void ncb_accept(void* ctx, int eid, double density) {
 int ncb_budget(void* ctx, int base) {
     return static_cast<NegativeCycleBatch*>(ctx)->override_budget_(base);
 }
+
+// Simple scope guard for TBB hookup
+struct TBBHookScope {
+    TBBHookScope(void* ctx,
+                 void (*emit)(void*, int, double),
+                 void (*accept)(void*, int, double),
+                 int  (*budget)(void*, int)) {
+        TBB_set_active(ctx, emit, accept, budget);
+    }
+    ~TBBHookScope() {
+        TBB_clear_active();
+    }
+};
 
 // helper
 static inline long long key64_pair(int a, int b) {
@@ -147,6 +161,7 @@ void NegativeCycleBatch::build_pos_adj_and_index_(
     TriangleBucketBatch::EdgeIndex& edge_index) const
 {
     pos_adj.assign((size_t)vcount_, {});
+    // Map all edges to full-eid; only positive edges go to adjacency
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
         const auto se = G_.signs_view()[eid];
         igraph_integer_t u = se.points.first, v = se.points.second;
@@ -159,19 +174,23 @@ void NegativeCycleBatch::build_pos_adj_and_index_(
 }
 
 int NegativeCycleBatch::override_budget_(int base) const {
-    return base;
+    return base; // passthrough (anneal later if needed)
 }
 
 void NegativeCycleBatch::on_emit_(int full_eid, double used_density) {
+    // Steer Dijkstra away from overused positive edges within this batch
     if (full_eid < 0 || full_eid >= (int)full2pos_eid_.size()) return;
     igraph_integer_t pe = full2pos_eid_[(size_t)full_eid];
     if (pe < 0) return;
+    // Tiny bump proportional to median and used_density
     const double bump = 0.05 * med_base_pos_ * std::max(0.0, used_density);
     VECTOR(saved_weights_pos_)[pe] = std::max(1e-12, VECTOR(saved_weights_pos_)[pe] + bump);
+    // Track usage density for persistent (ω/H) updates at commit time
     used_in_batch_pos_[(size_t)pe] += std::max(0.0, used_density);
 }
 
 void NegativeCycleBatch::on_accept_(int full_eid, double /*density*/) {
+    // Persistent cross-batch drift on edges that were used in accepted triangles
     bump_cross_batch_(full_eid, /*|C|=*/3);
 }
 
@@ -182,13 +201,16 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
     const auto edge_idx = G_.edge_index();
     covered_neg_eids.clear();
 
+    // Build TriangleBucketBatch inputs
     TriangleBucketBatch::PosAdj pos_adj;
     TriangleBucketBatch::EdgeIndex edge_index;
     build_pos_adj_and_index_(pos_adj, edge_index);
 
+    // Neg edges under current switching
     std::vector<std::pair<int,int>> neg_edges_pairs; neg_edges_pairs.reserve(neg_edges_.size());
     for (const auto& e : neg_edges_) neg_edges_pairs.emplace_back(e.first, e.second);
 
+    // Params (use P_.tbb; ensure sane defaults)
     TriangleBucketBatch::Params P = P_.tbb;
     if (P.K_tri_per_neg <= 0) P.K_tri_per_neg = 8;
     if (P.cap_per_vertex <= 0) P.cap_per_vertex = tri_cap_per_vertex_;
@@ -196,6 +218,7 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
 
     TriangleBucketBatch tbb(neg_edges_pairs, pos_adj, edge_index, P);
 
+    // Scorer: primary = sum(1/ω'(uw), 1/ω'(wv)) using current working weights; secondary free
     auto scorer = [&](TriangleBucketBatch::Candidate& c) {
         auto pe_uw = (c.pos_eid_uw >= 0 && c.pos_eid_uw < (int)full2pos_eid_.size()) ? full2pos_eid_[(size_t)c.pos_eid_uw] : -1;
         auto pe_wv = (c.pos_eid_wv >= 0 && c.pos_eid_wv < (int)full2pos_eid_.size()) ? full2pos_eid_[(size_t)c.pos_eid_wv] : -1;
@@ -206,26 +229,30 @@ bool NegativeCycleBatch::run_triangle_first_batch_(
         c.viol = 0.0; c.phi = 0.0;
     };
 
+    // Build buckets and select with active bridges
     tbb.build_buckets(scorer);
-    TBB_set_active(static_cast<void*>(this), &ncb_emit, &ncb_accept, &ncb_budget);
-    const auto& selected = tbb.select(covered_neg_eids);
-    TBB_clear_active();
+    {
+        TBBHookScope scope(static_cast<void*>(this), &ncb_emit, &ncb_accept, &ncb_budget);
+        const auto& selected = tbb.select(covered_neg_eids);
 
-    for (const auto& c : selected) {
-        std::vector<Edge> cyc_path;
-        cyc_path.emplace_back(c.u, c.w);
-        cyc_path.emplace_back(c.w, c.v);
+        // Emit accepted triangles as NegativeCycle (two positive edges path)
+        for (const auto& c : selected) {
+            std::vector<Edge> cyc_path;
+            cyc_path.emplace_back(c.u, c.w);
+            cyc_path.emplace_back(c.w, c.v);
 
-        out.emplace_back(Edge{c.u, c.v}, std::move(cyc_path));
-        ++total_found_;
-        ++tri_used_per_vertex_[c.u];
-        ++tri_used_per_vertex_[c.v];
-        ++tri_used_per_vertex_[c.w];
-        igraph_integer_t neg_eid = (igraph_integer_t) edge_idx[Edge{c.u, c.v}];
-        if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
+            out.emplace_back(Edge{c.u, c.v}, std::move(cyc_path));
+            ++total_found_;
+            // Update per-vertex caps & coverage
+            ++tri_used_per_vertex_[c.u];
+            ++tri_used_per_vertex_[c.v];
+            ++tri_used_per_vertex_[c.w];
+            igraph_integer_t neg_eid = (igraph_integer_t) edge_idx[Edge{c.u, c.v}];
+            if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
+        }
     }
 
-    return !selected.empty();
+    return !out.empty();
 }
 
 bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
@@ -242,14 +269,15 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 
     const size_t before_total = total_found_;
 
-    // Triangle-first
+    // === Triangle-first (bucketed) ===
     std::vector<NegativeCycle> triangles;
-    std::vector<int> covered_neg_eids;
+    std::vector<int> covered_neg_eids;   // full-eids of anchors with a nonempty bucket
     if (run_triangle_first_batch_(triangles, covered_neg_eids)) {
         triangles_emitted_now += triangles.size();
         for (auto& C : triangles) out.push_back(std::move(C));
     }
 
+    // Build uncovered list for SP (remove all nonempty bucket anchors)
     std::unordered_set<int> covered_set(covered_neg_eids.begin(), covered_neg_eids.end());
     std::vector<Edge> neg_edges_uncov; neg_edges_uncov.reserve(neg_edges_.size());
     for (const auto& e_neg : neg_edges_) {
@@ -259,7 +287,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 
     std::vector<Edge> new_disconnected; new_disconnected.reserve(neg_edges_uncov.size());
 
-    // SP on uncovered (kept simple; same as before)
+    // === SP-based generation on uncovered anchors ===
     for (const auto& e_neg : neg_edges_uncov) {
         const int uu = e_neg.first, vv = e_neg.second;
 
@@ -296,11 +324,12 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                     path_full_eids.push_back(feid);
                 }
             }
+            // Count usage on this shortest path for persistent repulsion
             for (auto peid : path_pos_eids) used_in_batch_pos_[(size_t)peid] += 1.0;
 
             const auto t_chk0 = clock::now();
             bool valid = true;
-            uint64_t sig = 1469598103934665603ull;
+            uint64_t sig = 1469598103934665603ull; // FNV-1a signature
             for (auto peid : path_pos_eids) { sig ^= (uint64_t)peid; sig *= 1099511628211ull; }
             if (!seen_paths.insert(sig).second) valid = false;
             ms_check += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_chk0).count();
@@ -311,6 +340,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                 path_nodes_scanned += nodes_on_path;
                 for (size_t i = 0; i < path_pos_eids.size(); ++i) ++pos_edges_on_paths;
 
+                // If triangle-length path, enforce triangle per-vertex caps
                 if (nodes_on_path == 3) {
                     igraph_integer_t pe1 = path_pos_eids[0], pe2 = path_pos_eids[1];
                     igraph_integer_t e1  = pos2full_eid_[pe1], e2 = pos2full_eid_[pe2];
@@ -331,6 +361,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                     }
                 }
 
+                // Cross-batch bump along path
                 const int L = nodes_on_path;
                 for (auto feid : path_full_eids) bump_cross_batch_(feid, L);
 
@@ -340,9 +371,11 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
                 igraph_integer_t neg_eid = (igraph_integer_t) edge_idx[Edge{uu, vv}];
                 if (neg_eid >= 0 && neg_eid < ecount_) neg_edge_covered_[(size_t)neg_eid] = 1;
 
+                // Soft mask bumps to encourage alternative path next rep
                 for (auto peid : path_pos_eids) VECTOR(saved_weights_pos_)[peid] += alt_path_bump_;
                 ms_emit += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_emit0).count();
             } else {
+                // Duplicate path -> bigger bump to break ties
                 for (auto peid : path_pos_eids) VECTOR(saved_weights_pos_)[peid] += 2.0 * alt_path_bump_;
             }
 
@@ -357,6 +390,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
     if (!made_progress) {
         finished_ = true;
     } else if (cover_) {
+        // Keep only negatives that failed to produce any path under SP (disconnected)
         neg_edges_.swap(new_disconnected);
         if (neg_edges_.empty()) finished_ = true;
     } else {

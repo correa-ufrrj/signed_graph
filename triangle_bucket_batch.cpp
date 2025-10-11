@@ -1,22 +1,17 @@
+// triangle_bucket_batch.cpp
 #include "triangle_bucket_batch.h"
 #include <unordered_map>
+#include <algorithm>
 
-// Weak, overridable integration hooks:
 extern "C" {
-#if defined(__GNUC__) || defined(__clang__)
-// Weak, overridable defaults for GCC/Clang
-__attribute__((weak)) void TBB_on_emit(int /*edge_id*/, double /*used_density*/) {}
-__attribute__((weak)) void TBB_on_accept(int /*edge_id*/, double /*density*/) {}
-__attribute__((weak)) int  TBB_budget_override(int base) { return base; }
-#else
-// On MSVC (or other compilers), do NOT provide defaults here.
-// The strong definitions must come from the pipeline.
-#endif
+void TBB_on_emit(int edge_id, double used_density);
+void TBB_on_accept(int edge_id, double density);
+int  TBB_budget_override(int base);
 }
 
-// Returns indices into internal 'selected_' vector; also outputs the set of
-// covered anchors (neg edge ids) in 'covered_neg_out'.
-const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_neg_out) {
+// Returns selected candidates; also outputs the set of covered anchors (neg edge ids).
+const std::vector<TriangleBucketBatch::Candidate>&
+TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_neg_out) {
     selected_.clear();
     taken_.clear();
     covered_neg_out.clear();
@@ -30,6 +25,7 @@ const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(s
     keys.reserve(buckets_.size());
     for (auto& kv : buckets_) keys.push_back(kv.first);
     std::sort(keys.begin(), keys.end());
+
     // Spec: covered_neg_out lists all nonempty bucket keys (incl. reheat-seeded)
     for (EdgeId key : keys) {
         if (!buckets_[key].empty()) covered_neg_out.push_back(key);
@@ -38,7 +34,6 @@ const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(s
     // Annealed budget and within-batch density (positive edges only)
     int budget = TBB_budget_override(P_.B_tri);
     std::unordered_map<EdgeId, double> used_in_this_batch;
-
 
     // Pass 1: one per bucket
     for (EdgeId key : keys) {
@@ -93,7 +88,8 @@ const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(s
 const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::selected() const { return selected_; }
 
 // Access buckets (read-only)
-const std::unordered_map<TriangleBucketBatch::EdgeId, std::vector<TriangleBucketBatch::Candidate>>& TriangleBucketBatch::buckets() const { return buckets_; }
+const std::unordered_map<TriangleBucketBatch::EdgeId, std::vector<TriangleBucketBatch::Candidate>>&
+TriangleBucketBatch::buckets() const { return buckets_; }
 
 const TriangleBucketBatch::Params& TriangleBucketBatch::params() const { return P_; }
 TriangleBucketBatch::Params& TriangleBucketBatch::params() { return P_; }
@@ -141,3 +137,4 @@ void TriangleBucketBatch::commit_(const Candidate& c, std::vector<int>& used) {
     used[c.w] += 1;
     taken_.insert(std::tuple<int,int,int>{c.u, c.w, c.v});
 }
+
