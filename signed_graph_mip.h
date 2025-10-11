@@ -7,7 +7,7 @@
 #include <chrono>
 
 // Forward-declare the stream class
-class NegativeCycleBatchStream;
+class NegativeCycleBatch;
 
 class SignedGraphForMIP : public SignedGraph {
 private:
@@ -17,7 +17,7 @@ private:
     std::vector<double> salience_full_;   // 1 - min(1, 2*|frac-0.5|) in [0,1]
 
 public:
-    friend class ::NegativeCycleBatchStream; // stream needs internals
+    friend class ::NegativeCycleBatch; // stream needs internals
 
 	const std::vector<double>& get_mask_weights() const { return mask_weights; }
 
@@ -43,5 +43,5 @@ public:
     std::vector<std::vector<NegativeCycle>> find_switched_lower_bound_grouped(bool cover) const;
 
     // Stream factory
-    NegativeCycleBatchStream open_negative_cycle_stream(bool cover, bool use_triangle_order = false) const;
+    NegativeCycleBatch open_negative_cycle_stream(bool cover, bool use_triangle_order = false) const;
 };

@@ -1,4 +1,3 @@
-// separation_pipeline.h
 #pragma once
 
 #include <vector>
@@ -13,6 +12,7 @@
 #include "signed_graph_mip.h"      // SignedGraphForMIP
 #include "reheat_pool.h"           // ReheatPool
 #include "cycle_key.h"             // fmkey::CycleKey
+#include "separation_config.h"     // SeparationConfig + adapters
 
 // Extern hooks used by TriangleBucketBatch. We provide strong definitions
 // in separation_pipeline.cpp and declare them as friends inside the class so
@@ -23,45 +23,11 @@ void TBB_on_accept(int edge_id, double density);
 int  TBB_budget_override(int base);
 }
 
-
-// STEP 1 NOTES
-// ------------
 // This header carves out the persistent/per-round state and declares the round
 // driver shell. There is NO behavior change yet. Methods are stubs and will be
 // filled in during steps 2–8 of the incremental plan.
 
-struct SeparationConfig {
-    // Ranking knobs
-    double alpha        = 0.3;   // weight inversion multiplier for 1/ω′ term
-    double theta        = 0.5;   // salience bonus multiplier
 
-    // Working & persistent weight knobs
-    double lambda_hist  = 0.20;  // history → log(1+H) multiplier
-    double lambda_LP    = 0.0;   // LP guidance (kept 0.0 for step 2)
-    double beta_emit    = 0.02;  // within-batch bump magnitude
-    double beta_sel     = 0.05;  // cross-batch drift magnitude
-    double omega_eps    = 1e-8;  // lower clamp for ω and ω′
-    double omega_max    = 64.0;  // upper clamp for ω
-
-    // Budgets / caps (defaults; may be specialized per phase)
-    int    B_tri        = 0;     // if 0: auto from #candidates (triangle stage)
-    int    K_tri_per_neg= 8;     // per-bucket prefilter cap (triangles)
-    int    tri_cap_per_vertex = 6;
-
-    int    B_sp         = 0;     // if 0: auto (SP stage)
-    int    K_sp_per_neg = 3;     // per-bucket cap (SP)
-    int    sp_cap_per_vertex  = 8;
-
-    // Annealing schedule for B_tri (fractional phase)
-    int    B_tri_min    = 1;
-    double gamma_min    = 0.70;
-    double gamma_max    = 0.92;
-    double v0           = 0.10;  // target violation level
-    double tau          = 0.10;  // softness
-
-    // Recent-key TTL (rounds)
-    int    recent_ttl   = 3;
-};
 
 struct SeparationPersistent {
     // Edge-aligned arrays over the FULL graph (size = |E|)
@@ -133,7 +99,7 @@ struct RoundGraphView {
     }
 };
 
-// Optional: store the switching used for this round (filled in step 2)
+// store the switching used for this round
 struct RoundSwitching {
     std::shared_ptr<const std::vector<int>> s;  // partition {+1,-1}
     bool from_fractional = false;               // true if came from fractional_greedy_switching

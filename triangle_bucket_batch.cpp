@@ -14,7 +14,6 @@ __attribute__((weak)) int  TBB_budget_override(int base) { return base; }
 #endif
 }
 
-
 // Returns indices into internal 'selected_' vector; also outputs the set of
 // covered anchors (neg edge ids) in 'covered_neg_out'.
 const std::vector<TriangleBucketBatch::Candidate>& TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_neg_out) {

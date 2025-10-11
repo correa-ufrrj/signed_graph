@@ -14,7 +14,6 @@
 #include <algorithm>
 
 #include "triangle_bucket_batch.h"
-#include "cycle_key.h"
 #include "reheat_pool.h"
 
 // Forward declarations (C linkage) for TBB hooks used by TriangleBucketBatch.
@@ -27,23 +26,29 @@ int  TBB_budget_override(int);
 
 class NegativeCycleBatch {
 public:
-    explicit NegativeCycleBatch(const SignedGraphForMIP& G, bool cover, bool use_triangle_order = false);
+    // Minimal, decoupled parameter pack for SP stage (mirrors TBB pattern)
+    struct Params {
+        int    B_sp               = 64;   // per-batch SP budget
+        int    K_sp_per_neg       = 3;    // alt paths per negative anchor
+        int    sp_cap_per_vertex  = 8;    // per-vertex cap for accepted SP cycles
+        int    tri_cap_per_vertex = 6;    // cap reused when NCB enforces per-vertex limits in triangle-first accept
+        double alt_path_bump_scale = 1.0; // scales med_base_pos_ to get alt_path_bump_
+        double cross_batch_penalty_scale = 3.0; // drift base_pos_ when cycles are accepted
+        TriangleBucketBatch::Params tbb{}; // pass-through for the internal triangle stage
+    };
+    explicit NegativeCycleBatch(const SignedGraphForMIP& G,
+                                bool cover,
+                                bool use_triangle_order = false,
+                                Params p = Params{});
     bool next(std::vector<NegativeCycle>& out);
+
+    void set_params(const Params& p) { P_ = p; }
+    const Params& params() const     { return P_; }
 
     int  total_cycles_emitted() const;
     int  batches_emitted()      const;
-    void set_lp_scores_full_edges(const std::vector<double>& s, double alpha=1.0, double beta=0.3);
 
-    // Access emitted cycle keys (stateless de-dup / reheat wiring)
-    const std::vector<fmkey::CycleKey>& emitted_keys() const { return emitted_keys_; }
-    void clear_emitted_keys() { emitted_keys_.clear(); }
-
-    // Optional: seed a ReheatPool as cycles are accepted
-    void set_reheat_pool(ReheatPool* pool) { reheat_pool_ = pool; }
-
-    // === Usage density export (for persistent updates) ===
-    // Resets within-batch usage counters on the positive-edge graph.
-    void reset_usage_counters();
+    // Stateless de-dup & reheat moved to the pipeline driver; NCB no longer owns them.
     // Read-only view of per-positive-edge usage density accumulated in this batch.
     const std::vector<double>& pos_usage_density() const { return used_in_batch_pos_; }
     // Accumulate the pos-graph usage density into a full-edge vector (dst is resized if needed).
@@ -55,6 +60,7 @@ public:
     friend int  ::TBB_budget_override(int);
 
 private:
+    Params P_{};
     const SignedGraphForMIP& G_;
     igraph_integer_t vcount_{0};
     igraph_integer_t ecount_{0};
@@ -79,12 +85,10 @@ private:
     int                 batches_emitted_{0};
 
     // triangle-aware ordering (kept for compatibility; triangles now run via TBB)
-    bool               use_tri_order_ = false;
-    std::vector<int>   neg_tri_vert_;  // per-vertex negative triangle counts
-    inline int edge_tri_score_(igraph_integer_t /*eid*/) const { return 0; } // legacy no-op
+     // legacy no-op
 
     // Cross-batch: bump base_pos_ when a cycle/triangle is accepted
-    double cross_batch_penalty_scale_ = 3.0;
+    
 
     // Positive-only graph + mappings
     igraph_t g_pos_{};
@@ -107,23 +111,11 @@ private:
     std::vector<double> used_in_batch_pos_;
 
     // Scoring/LP blending (carried across batches)
-    int    K_tri_per_neg_ = 3;
-    double overlap_penalty_gamma_ = 0.25;
-    std::vector<double> lp_score_full_;
-    bool   use_lp_weights_ = false;
-    double lp_alpha_ = 1.0, lp_beta_ = 0.3;
-
-    std::vector<int> tri_cap_per_v_; // adaptive (legacy), still used for SP acceptance
-
-    // === Stateless dedup + reheat plumbing ===
-    std::vector<fmkey::CycleKey> emitted_keys_;
-    std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> recent_local_;
-    ReheatPool* reheat_pool_ = nullptr;
-
+    
     inline void bump_cross_batch_(int eid, int cycle_len) {
         if (cycle_len <= 0) return;
         if (eid >= 0 && eid < static_cast<int>(base_pos_.size())) {
-            base_pos_[(size_t)eid] += cross_batch_penalty_scale_ + 1.0 / static_cast<double>(cycle_len);
+            base_pos_[(size_t)eid] += P_.cross_batch_penalty_scale + 1.0 / static_cast<double>(cycle_len);
         }
     }
 
@@ -147,6 +139,6 @@ private:
     int  override_budget_(int base) const;              // annealing hook (kept simple)
 
     // allow k alternate shortest paths per neg edge (soft mask)
-    int    K_sp_per_neg_ = 3;
+    
     double alt_path_bump_ = 1.0; // scaled from med_base_pos_ at build
 };

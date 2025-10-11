@@ -1,3 +1,4 @@
+/* triangle_bucket_batch.h */
 #pragma once
 
 #include <vector>
@@ -7,8 +8,6 @@
 #include <algorithm>
 #include <limits>
 #include <cstddef>
-#include <tuple>
-#include <functional>
 #include <tuple>
 #include <functional>
 #include <utility>
@@ -85,8 +84,6 @@ public:
         int cap_per_vertex= 3;      // per-vertex cap across the batch (small integer)
     };
 
-	// Constructor
-	//
 	// neg_edges: list of (u,v) that are negative under current switching
 	// pos_adj  : adjacency of G^+_σ
 	// edge_index: map (min(u,v),max(u,v)) -> y-index / internal edge id
