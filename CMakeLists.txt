@@ -23,17 +23,17 @@ include_directories(
 
 # Gather source files
 set(SOURCES
-#    main.cpp
+    main.cpp
     frustration_model.cpp
     frustration_model_xy.cpp
-#    frustration_model_x.cpp
-#    modularity_model.cpp
+    frustration_model_x.cpp
+    modularity_model.cpp
     triangle_bucket_batch.cpp
     negative_cycle_batch.cpp
-#    anneal_tri_budget.cpp
-#    reheat_pool.cpp
-#    signed_graph.cpp
-#    signed_graph_mip.cpp
+    anneal_tri_budget.cpp
+    reheat_pool.cpp
+    signed_graph.cpp
+    signed_graph_mip.cpp
     separation_pipeline.cpp
 )
 

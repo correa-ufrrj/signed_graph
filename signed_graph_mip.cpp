@@ -1,94 +1,122 @@
 // File: signed_graph_mip.cpp
 #include "signed_graph_mip.h"
+#include "negative_cycle_batch.h"
+
 #include <algorithm>
+#include <numeric>
 #include <limits>
 #include <cmath>
-#include <iostream>
-#include <unordered_map>
-#include <set>
-#include <boost/heap/pairing_heap.hpp>
-#include <numeric>
 
-// Correct signature for igraph ≥ 0.10.x
-void silent_warning_handler(const char* reason, const char* file, int line) {
-    // Suppress all warnings
-}
+// ─────────────────────────────────────────────────────────────
+// Constructors / destructor
+// ─────────────────────────────────────────────────────────────
 
-// SignedGraphForMIP default clone constructor
 SignedGraphForMIP::SignedGraphForMIP(const SignedGraph* const other)
-  : SignedGraph(other), frac_weights(other->edge_count(), 0.0),
-    mask_weights(other->edge_count(), 0.0) {
+    : SignedGraph(other),
+      frac_weights(other->edge_count(), 0.0),
+      mask_weights(other->edge_count(), 0.0) {
+    // Build local edge -> eid map (canonicalized Edge keys)
     const auto& edge_map = this->edge_index();
-    for (const auto& [edge, eid] : edge_map) {
-        edge_to_eid[edge] = eid;
+    for (const auto& kv : edge_map) {
+        const Edge& e = kv.first;
+        igraph_integer_t eid = kv.second;
+        edge_to_eid[e] = eid;
     }
 }
 
-// SignedGraphForMIP weight-based clone constructor
 SignedGraphForMIP::SignedGraphForMIP(const SignedGraph* const other, std::vector<double> new_weights)
-  : SignedGraph(other, std::move(new_weights)), frac_weights(other->edge_count(), 0.0),
-    mask_weights(other->edge_count(), 0.0) {
+    : SignedGraph(other, std::move(new_weights)),
+      frac_weights(other->edge_count(), 0.0),
+      mask_weights(other->edge_count(), 0.0) {
     const auto& edge_map = this->edge_index();
-    for (const auto& [edge, eid] : edge_map) {
-        edge_to_eid[edge] = eid;
+    for (const auto& kv : edge_map) {
+        const Edge& e = kv.first;
+        igraph_integer_t eid = kv.second;
+        edge_to_eid[e] = eid;
     }
 }
 
 SignedGraphForMIP::SignedGraphForMIP(const std::string& file_path)
-    : SignedGraph(file_path)
-{
-    for (int eid = 0; eid < edge_count(); ++eid) {
+    : SignedGraph(file_path) {
+    const igraph_integer_t m = edge_count();
+    // Build local edge -> eid map (canonicalized Edge keys)
+    for (igraph_integer_t eid = 0; eid < m; ++eid) {
         igraph_integer_t u, v;
         igraph_edge(&g, eid, &u, &v);
-        edge_to_eid[{static_cast<int>(u), static_cast<int>(v)}] = eid;
+        edge_to_eid[Edge{static_cast<int>(u), static_cast<int>(v)}] = eid;
     }
-
-    frac_weights.resize(weights.size());
-	mask_weights.resize(weights.size());
-	std::transform(weights.begin(), weights.end(), frac_weights.begin(),
-	               [](double v){ return static_cast<double>(v); });
-	std::fill(mask_weights.begin(), mask_weights.end(), 0.0);
+    // Initialize working arrays
+    frac_weights.assign((size_t)m, 0.0);
+    mask_weights.assign((size_t)m, 0.0);
+    salience_full_.clear();
 }
 
-SignedGraphForMIP::~SignedGraphForMIP() {
-}
+SignedGraphForMIP::~SignedGraphForMIP() = default;
+
+// ─────────────────────────────────────────────────────────────
+// Fractional guidance → salience (edge-aligned)
+// ─────────────────────────────────────────────────────────────
 
 bool SignedGraphForMIP::weighting_from_fractional(const std::vector<double>& x,
                                                   const std::vector<double>& y) {
-    igraph_integer_t ecount = edge_count();
-    bool has_changed = false;
-    auto signs = signs_view();
+    const igraph_integer_t m = edge_count();
+    if ((int)frac_weights.size() != m)   frac_weights.assign((size_t)m, 0.0);
+    if ((int)mask_weights.size() != m)   mask_weights.assign((size_t)m, 0.0);
+    // keep salience_full_ empty; edge_salience_view() will return mask_weights if empty
 
-    if (mask_weights.size() != static_cast<size_t>(ecount))
-        mask_weights.assign(ecount, 0.0);
+    const auto signs = signs_view();
 
-    for (igraph_integer_t eid = 0; eid < ecount; ++eid) {
-        igraph_integer_t from, to; igraph_edge(&g, eid, &from, &to);
-        const int old_w = signs[eid].sign; // ±1 (or ±0.0 treated consistently)
-        // frac_weights in [0,2] since tau∈[-1,1]; map to [0,1] via 0.5×
-        const double tau = 4.0 * y[eid] - 2.0 * x[from] - 2.0 * x[to] + 1.0; // ∈[-1,1]
-        frac_weights[eid] = 1.0 - tau * old_w;            // ∈[0,2]
-        const double t01 = 0.5 * frac_weights[eid];       // ∈[0,1]
+    bool changed = false;
+    for (igraph_integer_t eid = 0; eid < m; ++eid) {
+        igraph_integer_t u, v; igraph_edge(&g, eid, &u, &v);
+        const int s = signs[eid].sign; // ±1
+
+        // τ(x,y) = 4y_uv − 2x_u − 2x_v + 1 ∈ [-1,1]
+        const double tau = 4.0 * y[(size_t)eid]
+                         - 2.0 * ((size_t)u < x.size() ? x[(size_t)u] : 0.0)
+                         - 2.0 * ((size_t)v < x.size() ? x[(size_t)v] : 0.0)
+                         + 1.0;
+
+        // fractional "weight" in [0,2], then map to [0,1]
+        const double frac = 1.0 - tau * static_cast<double>(s); // ∈ [0,2]
+        frac_weights[(size_t)eid] = frac;
+
+        const double t01 = 0.5 * frac; // ∈ [0,1]
         // salience: 1 at 0.5, fades to 0 at 0 or 1
-        mask_weights[eid] = 1.0 - std::min(1.0, 2.0 * std::abs(t01 - 0.5));
+        double sal = 1.0 - std::min(1.0, 2.0 * std::fabs(t01 - 0.5));
+        if (sal < 0.0) sal = 0.0;
+        if (sal > 1.0) sal = 1.0;
+        mask_weights[(size_t)eid] = sal;
 
-        has_changed |= std::abs(y[eid] - x[from] * x[to]) > 1e-5;
+        // crude change detector (optional, used by callers heuristically)
+        const double y_hat = ( (size_t)u < x.size() && (size_t)v < x.size() )
+                           ? (x[(size_t)u] * x[(size_t)v])
+                           : 0.0;
+        if (std::fabs(y[(size_t)eid] - y_hat) > 1e-5) changed = true;
     }
-    return has_changed;
+    return changed;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Switching helpers
+// ─────────────────────────────────────────────────────────────
+
 const std::vector<int> SignedGraphForMIP::greedy_switching() {
-    SignedGraph::GreedyKickOptions opts;  // pure integer greedy: no fractional guidance
+    SignedGraph::GreedyKickOptions opts; // pure-integer pass
     return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts);
 }
 
-// ---- fractional_greedy_switching overloads (SignedGraphForMIP) ----
 std::optional<std::shared_ptr<const std::vector<int>>>
 SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts) {
-    SignedGraph::GreedyKickOptions opts = user_opts; // local copy
-    // If you have LP vectors here, set:
-    //   opts.frac_x = &lp_x;
-    //   opts.frac_y = &lp_y;  // optional
+    auto opts = user_opts; // copy (caller may have already set frac_x/frac_y)
+    auto sp = std::make_shared<const std::vector<int>>(
+        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
+    return sp;
+}
+
+std::optional<std::shared_ptr<const std::vector<int>>>
+SignedGraphForMIP::fractional_greedy_switching() {
+    SignedGraph::GreedyKickOptions opts;
     auto sp = std::make_shared<const std::vector<int>>(
         this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
     return sp;
@@ -105,26 +133,26 @@ SignedGraphForMIP::fractional_greedy_switching(const std::vector<double>& x,
     return sp;
 }
 
-std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching() {
-    SignedGraph::GreedyKickOptions opts;
-    auto sp = std::make_shared<const std::vector<int>>(
-        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
-    return sp;
+// ─────────────────────────────────────────────────────────────
+// Negative-cycle finder wrappers
+// ─────────────────────────────────────────────────────────────
+
+NegativeCycleBatch SignedGraphForMIP::open_negative_cycle_stream(bool cover,
+                                                                 bool use_triangle_order) const {
+    return NegativeCycleBatch(*this, cover, use_triangle_order);
 }
 
-// --- SignedGraphForMIP wrappers over the stream ---
 std::vector<NegativeCycle>
 SignedGraphForMIP::find_switched_lower_bound(bool cover) {
-    std::vector<NegativeCycle> flat;
+    std::vector<NegativeCycle> out;
     auto stream = open_negative_cycle_stream(cover);
     std::vector<NegativeCycle> batch;
     while (stream.next(batch)) {
-        flat.insert(flat.end(),
-                    std::make_move_iterator(batch.begin()),
-                    std::make_move_iterator(batch.end()));
+        out.insert(out.end(),
+                   std::make_move_iterator(batch.begin()),
+                   std::make_move_iterator(batch.end()));
     }
-    return flat;
+    return out;
 }
 
 std::vector<std::vector<NegativeCycle>>

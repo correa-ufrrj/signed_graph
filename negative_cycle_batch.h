@@ -36,6 +36,10 @@ public:
         double cross_batch_penalty_scale = 3.0; // drift base_pos_ when cycles are accepted
         TriangleBucketBatch::Params tbb{}; // pass-through for the internal triangle stage
     };
+	NegativeCycleBatch(const SignedGraphForMIP& G,
+	                   const std::vector<Edge>& neg_edges_uncov,
+	                   bool cover,
+	                   Params p);
 	// negative_cycle_batch.h  (only the constructor declarations shown here)
 	explicit NegativeCycleBatch(const SignedGraphForMIP& G,
 	                            bool cover,
@@ -131,11 +135,9 @@ private:
         return G_.get_switched_weight()[eid] > 0.0;
     }
 
+	static std::vector<Edge> collect_all_negatives_(const SignedGraphForMIP& G);
     void build_initial_state_();
     void build_mask_for_batch_();
-
-    // ---------- Triangle-first batch (via TriangleBucketBatch) ----------
-    bool run_triangle_first_batch_(std::vector<NegativeCycle>& out, std::vector<int>& covered_neg_eids);
 
     void build_pos_adj_and_index_(
         TriangleBucketBatch::PosAdj& pos_adj,

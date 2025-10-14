@@ -29,6 +29,10 @@ struct Edge {
         return first == other.first && second == other.second;
     }
 
+    bool operator<(const Edge& other) const {
+        return (first < other.first) || (first == other.first && second < other.second);
+    }
+
     bool is_adjacent_to(const Edge& other) const {
         return first == other.first || first == other.second ||
                second == other.first || second == other.second;

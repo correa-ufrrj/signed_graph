@@ -54,6 +54,7 @@ struct TupleEq {
 //   VertexId: integer id of a vertex
 //   EdgeId  : integer id of an undirected edge (consistent with model y-index)
 //
+// In triangle_bucket_batch.h (minimal additions)
 class TriangleBucketBatch {
 public:
     using VertexId = int;
@@ -92,7 +93,12 @@ public:
 	                                   const PosAdj& pos_adj,
 	                                   const EdgeIndex& edge_index,
 	                                   TriangleBucketBatch::Params params)
-	    : neg_edges_(neg_edges), pos_adj_(pos_adj), edge_index_(edge_index), P_(params) {}
+	    : neg_edges_(neg_edges), pos_adj_(pos_adj), edge_index_(edge_index), P_(params) {
+			    stats_ = Stats{};
+			    stats_.neg_edges = (int)neg_edges.size();
+    			stats_.B_tri     = params.B_tri;
+		}
+	    
 	
 	// Convenience overload: uses default Params{} (avoids default-arg inside class)
 	explicit TriangleBucketBatch(const std::vector<std::pair<VertexId,VertexId>>& neg_edges,
@@ -125,6 +131,17 @@ public:
     const TriangleBucketBatch::Params& params() const;
     TriangleBucketBatch::Params& params();
 
+    struct Stats {
+        int         neg_edges       = 0;      // number of negative anchors provided
+        int         buckets_nonempty= 0;      // how many anchors produced >=1 candidate
+        long long   candidates      = 0;      // total candidates across all buckets
+        int         B_tri           = 0;      // configured budget at build time
+        int         B_eff           = 0;      // effective budget actually used in select()
+        int         selected        = 0;      // triangles selected
+    };
+
+    const Stats& stats() const { return stats_; }
+
 private:
     // Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
     static long long key_(VertexId a, VertexId b);
@@ -143,6 +160,7 @@ private:
     std::unordered_map<EdgeId, std::vector<Candidate>> buckets_;
     std::vector<Candidate> selected_;
     std::unordered_set<std::tuple<VertexId,VertexId,VertexId>, tbb_detail::TupleHash, tbb_detail::TupleEq> taken_;
+    Stats stats_; // <- new lightweight stats holder
 };
 // --- Template implementation ---
 template <class Scorer>
@@ -186,4 +204,14 @@ inline void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
             buck.resize(P_.K_tri_per_neg);
         }
     }
+    // Now compute the light stats without exposing internals
+    int nonempty = 0;
+    long long total = 0;
+    for (const auto& bucket : buckets_) { // assume internal: std::vector<std::vector<Candidate>> buckets_;
+	    const auto& vec = bucket.second;
+	    if (!vec.empty()) ++nonempty;
+	    total += static_cast<long long>(vec.size());
+	}
+    stats_.buckets_nonempty = nonempty;
+    stats_.candidates       = total;
 }

@@ -1,23 +1,39 @@
 // File: frustration_model.cpp
 #include "frustration_model.h"
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <chrono>
 #include <iomanip>
+#include <unordered_set>
 
-std::chrono::steady_clock::time_point start_time;
-std::chrono::steady_clock::time_point end_time;
+// Accessor definitions
+ModelAccessor::ModelAccessor(IloCplex& cpx) : cpx_(cpx) {}
+void ModelAccessor::getValues(IloNumArray& out, const IloNumVarArray& vars) const {
+    cpx_.getValues(out, vars);
+}
+
+UserCutCallbackAccessor::UserCutCallbackAccessor(IloCplex::UserCutCallbackI& cb) : cb_(cb) {}
+void UserCutCallbackAccessor::getValues(IloNumArray& out, const IloNumVarArray& vars) const {
+    cb_.getValues(out, vars);
+}
 
 FrustrationModel::FrustrationModel(SignedGraphForMIP& g, int cut_flags)
-    : graph(g), model(env), cplex(model), use_cut_generator(cut_flags), lower_bound(IloIntMin), f_index(g.edge_count()), edge_index(g.edge_index()), signs(g.signs_view()), weights(g.weights_view()) {
+    : graph(g)
+    , model(env)
+    , cplex(model)
+    , use_cut_generator(cut_flags)
+    , lower_bound(IloIntMin)
+    , f_index(g.edge_count())
+    , edge_index(g.edge_index())
+    , signs(g.signs_view())
+    , weights(g.weights_view()) {
 
     m_minus = 0;
     for (const auto& [_, sign] : signs) if (sign < 0) m_minus++;
-	for (const auto& [e, idx] : edge_index) {
-	    edge_reverse[idx] = e;
-	}
+    for (const auto& [e, idx] : edge_index) {
+        edge_reverse[idx] = e;
+    }
 }
 
 void FrustrationModel::initialize_uncut_triangles() {
@@ -56,10 +72,9 @@ std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_triangl
     while (it != uncut_triangles.end()) {
         auto& triangle = *it;
         auto cuts = generate_pending_triangle_cuts(env, triangle);
-       	triangle_cuts.insert(triangle_cuts.end(), cuts.begin(), cuts.end());
+        triangle_cuts.insert(triangle_cuts.end(), cuts.begin(), cuts.end());
         ++it;
     }
-
     return triangle_cuts;
 }
 
@@ -68,8 +83,10 @@ std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_negativ
     auto cycles = graph.find_switched_lower_bound();
 
     for (const auto& cycle : cycles) {
-		if (use_cut_generator & TRIANGLE_CUTS)
-			if(cycle.pos_edges().size() == 2) continue;
+        // If triangle cuts are enabled, skip 2-pos cycles here to avoid duplicates.
+        if (use_cut_generator & TRIANGLE_CUTS)
+            if (cycle.pos_edges().size() == 2) continue;
+
         std::vector<Edge> all_edges = { cycle.neg_edge() };
         const auto& pos = cycle.pos_edges();
         all_edges.insert(all_edges.end(), pos.begin(), pos.end());
@@ -77,23 +94,6 @@ std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_negativ
         auto cuts = generate_cycle_cuts(env, all_edges);
         all_cuts.insert(all_cuts.end(), cuts.begin(), cuts.end());
     }
-
-    return all_cuts;
-}
-
-std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_negative_cycle_cover_cuts(IloEnv& env) {
-    std::vector<std::pair<IloRange, std::string>> all_cuts;
-    auto cycles = graph.find_switched_lower_bound(true);
-
-    for (const auto& cycle : cycles) {
-        std::vector<Edge> all_edges = { cycle.neg_edge() };
-        const auto& pos = cycle.pos_edges();
-        all_edges.insert(all_edges.end(), pos.begin(), pos.end());
-
-        auto cuts = generate_cycle_cuts(env, all_edges);
-        all_cuts.insert(all_cuts.end(), cuts.begin(), cuts.end());
-    }
-
     return all_cuts;
 }
 
@@ -111,24 +111,23 @@ double FrustrationModel::get_frustration_index() const {
 
 void FrustrationModel::solve() {
     start_time = std::chrono::steady_clock::now();
-    cplex.setParam(IloCplex::Param::Preprocessing::Presolve, IloFalse);  // Disable all presolve
-    cplex.setParam(IloCplex::Param::MIP::Cuts::Cliques, -1);     // Prevent clique cut generation
+
+    // Turn off most CPLEX cuts/heuristics to focus on our separation
+    cplex.setParam(IloCplex::Param::Preprocessing::Presolve, IloFalse);
+    cplex.setParam(IloCplex::Param::MIP::Cuts::Cliques, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::ZeroHalfCut, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::Gomory, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::LiftProj, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::MIRCut, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::GUBCovers, -1);
     cplex.setParam(IloCplex::Param::MIP::Cuts::FlowCovers, -1);
-    // Disable all internal heuristics
-    cplex.setParam(IloCplex::Param::MIP::Strategy::HeuristicFreq, -1);  // Turn off RINS and other heuristics
-    cplex.setParam(IloCplex::Param::MIP::Strategy::Probe, -1);          // Turn off probing heuristics
-    cplex.setParam(IloCplex::Param::MIP::Strategy::RINSHeur, -1);       // Turn off RINS
-    cplex.setParam(IloCplex::Param::MIP::Strategy::FPHeur, -1);         // Turn off feasibility pump
 
-//    cplex.setParam(IloCplex::Param::Parallel, CPX_PARALLEL_DETERMINISTIC);
-//    cplex.setParam(IloCplex::Param::Threads, 8);
+    cplex.setParam(IloCplex::Param::MIP::Strategy::HeuristicFreq, -1);
+    cplex.setParam(IloCplex::Param::MIP::Strategy::Probe, -1);
+    cplex.setParam(IloCplex::Param::MIP::Strategy::RINSHeur, -1);
+    cplex.setParam(IloCplex::Param::MIP::Strategy::FPHeur, -1);
 
-    cplex.setParam(IloCplex::Param::TimeLimit, 12600); // Set time limit to 2 1/2 hours
+    cplex.setParam(IloCplex::Param::TimeLimit, 12600);
 
     if (!cplex.solve()) {
         std::cerr << "[Solver] Optimization failed." << std::endl;
@@ -144,30 +143,29 @@ std::string FrustrationModel::active_cut_names() const {
     std::ostringstream oss;
     bool first = true;
 
-    if (use_cut_generator & NEGATIVE_CYCLE_CUTS) {
-        oss << (first ? "" : ";") << "NegativeCycles";
+    // When both flags are on, advertise the combined pipeline name
+    if (pipeline_enabled()) {
+        oss << "TriangleCyclePipeline";
         first = false;
-    }
-
-    if (use_cut_generator & NEGATIVE_CYCLE_COVER_CUTS) {
-        oss << (first ? "" : ";") << "NegativeCyclesCover";
-        first = false;
-    }
-
-    if (use_cut_generator & TRIANGLE_CUTS) {
-        oss << (first ? "" : ";") << "Triangles";
-        first = false;
+    } else {
+        if (use_cut_generator & NEGATIVE_CYCLE_CUTS) {
+            oss << (first ? "" : ";") << "NegativeCycles";
+            first = false;
+        }
+        if (use_cut_generator & TRIANGLE_CUTS) {
+            oss << (first ? "" : ";") << "Triangles";
+            first = false;
+        }
     }
 
     if (use_cut_generator & NET_DEGREE_CUTS) {
         oss << (first ? "" : ";") << "NetDegree";
     }
-
     return oss.str();
 }
 
 void FrustrationModel::print_solution() const {
-	std::cout << "Status: " << cplex.getStatus() << "\n";
+    std::cout << "Status: " << cplex.getStatus() << "\n";
     std::cout << "Lower bound (cycles): " << lower_bound << std::endl;
     std::cout << "Objective value: " << cplex.getObjValue() << std::endl;
     std::cout << "Frustration index: " << f_index << std::endl;
@@ -193,8 +191,8 @@ void FrustrationModel::export_solution(const std::string& file_prefix, bool with
          << "," << reversed_cycle_cuts_build
          << "," << standard_cycle_cuts_cutgen
          << "," << reversed_cycle_cuts_cutgen
-         << "," << cplex.getNnodes() << "," << injected_heuristic_solutions;
-    meta << "\n";
+         << "," << cplex.getNnodes() << "," << injected_heuristic_solutions
+         << "\n";
 
     meta.close();
 
@@ -202,4 +200,3 @@ void FrustrationModel::export_solution(const std::string& file_prefix, bool with
         graph.save_partition_svg(partition, file_prefix + "_partition.svg", true);
     }
 }
-

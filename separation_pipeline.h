@@ -28,7 +28,6 @@ int  TBB_budget_override(int base);
 // filled in during steps 2–8 of the incremental plan.
 
 
-
 struct SeparationPersistent {
     // Edge-aligned arrays over the FULL graph (size = |E|)
     std::vector<double> omega;         // persistent base weights ω ≥ eps (init 1.0)
@@ -120,6 +119,10 @@ public:
         int cycles_accepted    = 0;
     };
 
+    // One-shot: on next run_round(), reuse whatever switching is already set
+    // on the SignedGraph (skip restore+greedy). Thread-local guard lives in the .cpp.
+    void reuse_current_switching_once();
+
     Result run_round(const std::vector<double>* x_hat,
                      const std::vector<double>* y_hat,
                      Phase phase);
@@ -152,6 +155,9 @@ private:
     // Storage of triangle stage outputs for this round
     std::vector<TriAcc> tri_selected_;
     std::vector<int>    covered_neg_eids_;   // anchors that received at least one candidate
+
+    // Per-round exported keys (triangles now; SP in later step). Cleared at run start.
+    std::vector<fmkey::CycleKey> accepted_keys_;
 
     // Allow TBB C hooks to call our private methods
     friend void ::TBB_on_emit(int, double);

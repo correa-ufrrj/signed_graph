@@ -27,13 +27,12 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
     std::sort(keys.begin(), keys.end());
 
     // Spec: covered_neg_out lists all nonempty bucket keys (incl. reheat-seeded)
-    for (EdgeId key : keys) {
-        if (!buckets_[key].empty()) covered_neg_out.push_back(key);
-    }
+    for (EdgeId key : keys) if (!buckets_[key].empty()) covered_neg_out.push_back(key);
 
     // Annealed budget and within-batch density (positive edges only)
     int budget = TBB_budget_override(P_.B_tri);
     std::unordered_map<EdgeId, double> used_in_this_batch;
+    int budget_used = 0;  // <-- add this
 
     // Pass 1: one per bucket
     for (EdgeId key : keys) {
@@ -41,18 +40,21 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
         for (const auto& c : buck) {
             if (!respect_cap_(c, used_per_vertex)) continue;
             commit_(c, used_per_vertex);
-            // Cross-batch density: add 1/3 to all three edges of the triangle
+            ++budget_used;  // <-- count a committed triangle
             TBB_on_accept(c.neg_eid,    1.0/3.0);
             TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
             TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
-            // Within-batch mask bump on positive edges
             used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
             used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
             TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
             TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
             break; // at most one in Pass 1
         }
-        if ((int)selected_.size() >= budget) return selected_;
+        if ((int)selected_.size() >= budget) {
+            stats_.B_eff    = budget_used;           // <-- use budget_used (or selected_.size())
+            stats_.selected = (int)selected_.size();
+            return selected_;
+        }
     }
 
     // Pass 2: fill remaining up to B_tri
@@ -62,25 +64,26 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
         for (EdgeId key : keys) {
             auto& buck = buckets_[key];
             for (const auto& c : buck) {
-                // Skip if already chosen the same triangle (u,w,v) earlier
                 if (already_taken_(c)) continue;
                 if (!respect_cap_(c, used_per_vertex)) continue;
                 commit_(c, used_per_vertex);
-                // Cross-batch density: add 1/3 to all three edges of the triangle
+                ++budget_used;  // <-- count a committed triangle
                 TBB_on_accept(c.neg_eid,    1.0/3.0);
                 TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
                 TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
-                // Within-batch mask bump on positive edges
                 used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
                 used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
                 TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
                 TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
                 progressed = true;
-                break; // move to next bucket
+                break;
             }
             if ((int)selected_.size() >= budget) break;
         }
     }
+
+    stats_.B_eff    = budget_used;                 // <-- replace ‘effective_budget_used’
+    stats_.selected = (int)selected_.size();
     return selected_;
 }
 
@@ -137,4 +140,5 @@ void TriangleBucketBatch::commit_(const Candidate& c, std::vector<int>& used) {
     used[c.w] += 1;
     taken_.insert(std::tuple<int,int,int>{c.u, c.w, c.v});
 }
+
 
