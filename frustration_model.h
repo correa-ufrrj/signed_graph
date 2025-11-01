@@ -12,7 +12,6 @@
 #include <sstream>
 #include <unordered_map>
 
-// FrustrationModel.h (partial)
 struct TriangleInequalities {
     std::vector<Edge> triangle;
     std::vector<int> pending_cut_ids; // -1 for full triangle cut, vertex id for vertex-based cuts
@@ -39,6 +38,13 @@ struct UserCutCallbackAccessor final : LpAccessor {
     void getValues(IloNumArray& out, const IloNumVarArray& vars) const override;
 private:
     IloCplex::UserCutCallbackI& cb_;
+};
+
+struct HeuristicCallbackAccessor final : LpAccessor {
+    explicit HeuristicCallbackAccessor(IloCplex::HeuristicCallbackI& cb);
+    void getValues(IloNumArray& out, const IloNumVarArray& vars) const override;
+private:
+    IloCplex::HeuristicCallbackI& cb_;
 };
 
 class FrustrationModel {
@@ -81,8 +87,8 @@ protected:
     std::chrono::steady_clock::time_point end_time;
     std::shared_ptr<const std::vector<int>> switching_solution = nullptr;
     SignedGraph::SignedEdgesView signs;
-    SignedGraph::WeightsView weights;
-    SignedGraphForMIP::EdgeIndexesView edge_index;
+	std::vector<int> signs0;   // size = m, entries in {+1,-1}; frozen at construction
+    GraphCore::EdgeIndexesView edge_index;
     std::unordered_map<int, Edge> edge_reverse;
 
     double frustration_index(double obj_val) const;

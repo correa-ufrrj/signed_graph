@@ -1,3 +1,4 @@
+
 // negative_cycle_batch.h
 #pragma once
 
@@ -35,7 +36,17 @@ public:
         double alt_path_bump_scale = 1.0; // scales med_base_pos_ to get alt_path_bump_
         double cross_batch_penalty_scale = 3.0; // drift base_pos_ when cycles are accepted
         TriangleBucketBatch::Params tbb{}; // pass-through for the internal triangle stage
+
+        // NEW: optional per-full-edge positive lengths (e.g., ω′ or a function of salience).
+        // Size must be m = |E|; only entries for positive edges are used.
+        // If provided, these values are copied into saved_weights_pos_ and
+        // used directly by Dijkstra for path finding.
+        const std::vector<double>* guide_len_full = nullptr;
+
+        // Min length for numerical stability
+        double guide_len_eps = 1e-12;
     };
+
 	NegativeCycleBatch(const SignedGraphForMIP& G,
 	                   const std::vector<Edge>& neg_edges_uncov,
 	                   bool cover,
@@ -131,11 +142,6 @@ private:
         }
     }
 
-    inline bool edge_is_pos(igraph_integer_t eid) const {
-        return G_.get_switched_weight()[eid] > 0.0;
-    }
-
-	static std::vector<Edge> collect_all_negatives_(const SignedGraphForMIP& G);
     void build_initial_state_();
     void build_mask_for_batch_();
 

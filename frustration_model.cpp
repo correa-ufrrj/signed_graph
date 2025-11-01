@@ -18,6 +18,12 @@ void UserCutCallbackAccessor::getValues(IloNumArray& out, const IloNumVarArray& 
     cb_.getValues(out, vars);
 }
 
+HeuristicCallbackAccessor::HeuristicCallbackAccessor(IloCplex::HeuristicCallbackI& cb) : cb_(cb) {}
+void HeuristicCallbackAccessor::getValues(IloNumArray& out, const IloNumVarArray& vars) const {
+    out = IloNumArray(cb_.getEnv(), vars.getSize());
+    for (IloInt i = 0; i < vars.getSize(); ++i) out[i] = cb_.getValue(vars[i]);
+}
+
 FrustrationModel::FrustrationModel(SignedGraphForMIP& g, int cut_flags)
     : graph(g)
     , model(env)
@@ -26,13 +32,15 @@ FrustrationModel::FrustrationModel(SignedGraphForMIP& g, int cut_flags)
     , lower_bound(IloIntMin)
     , f_index(g.edge_count())
     , edge_index(g.edge_index())
-    , signs(g.signs_view())
-    , weights(g.weights_view()) {
+    , signs(g.signs_view()) {
 
     m_minus = 0;
     for (const auto& [_, sign] : signs) if (sign < 0) m_minus++;
+    const int m = graph.edge_count();
+    signs0.resize(m);
     for (const auto& [e, idx] : edge_index) {
         edge_reverse[idx] = e;
+        signs0[idx] = signs[(igraph_integer_t)idx].sign;
     }
 }
 
@@ -174,8 +182,9 @@ void FrustrationModel::print_solution() const {
 void FrustrationModel::export_solution(const std::string& file_prefix, bool with_svg, std::vector<int> partition) const {
     std::ofstream meta(file_prefix + "_summary.csv");
 
-    int frustrated = graph.frustrated_edges(partition);
-    auto neg_degrees = graph.minus_degrees_view();
+	auto Gp = graph.compose_switching(partition);
+    int frustrated = Gp.frustrated_edges();
+    auto neg_degrees = Gp.get_minus_degrees();
     int num_neg_edges = std::accumulate(neg_degrees.begin(), neg_degrees.end(), 0) / 2;
     double runtime = std::chrono::duration<double>(end_time - start_time).count();
 

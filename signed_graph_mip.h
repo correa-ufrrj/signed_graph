@@ -11,33 +11,30 @@ class NegativeCycleBatch;
 
 class SignedGraphForMIP : public SignedGraph {
 private:
-    mutable std::unordered_map<Edge, igraph_integer_t, EdgeHash> edge_to_eid;
-    std::vector<double> frac_weights;
-    std::vector<double> mask_weights;     // |frac - 0.5| (edge-aligned)
-    std::vector<double> salience_full_;   // 1 - min(1, 2*|frac-0.5|) in [0,1]
+	const std::vector<double> reference_s_;        // size |V|, entries ±1
+	const std::vector<double> reference_weights_; // this instance’s edge weights (±1 here)
 
 public:
     friend class ::NegativeCycleBatch; // stream needs internals
-
-	const std::vector<double>& get_mask_weights() const { return mask_weights; }
-
+	using SignedGraph::SignedGraph;
+  
     SignedGraphForMIP(const std::string& file_path);
-    SignedGraphForMIP(const SignedGraph* const other);
-    SignedGraphForMIP(const SignedGraph* const other, std::vector<double> new_weights);
+    SignedGraphForMIP(const SignedGraphForMIP* const other);
+    SignedGraphForMIP(const SignedGraphForMIP* const other, std::vector<double> new_weights);
+    SignedGraphForMIP(const SignedGraphForMIP* const other, std::vector<double> new_weights,
+    					const std::vector<double> new_s);
     ~SignedGraphForMIP();
-    
-    // Prefer normalized [0,1] salience; fallback to mask_weights if empty
-    const std::vector<double>& edge_salience_view() const {
-        return salience_full_.empty() ? mask_weights : salience_full_;
-    };
 
-    bool weighting_from_fractional(const std::vector<double>& x, const std::vector<double>& y);
-    const std::vector<int> greedy_switching();
-    std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching(const SignedGraph::GreedyKickOptions& opts);
-    std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching();
-    std::optional<std::shared_ptr<const std::vector<int>>> fractional_greedy_switching(const std::vector<double>& x,
-                                                                                       const std::vector<double>& y);
-
+	SignedGraphForMIP integer_projection() const;
+	void align_switching(const int u, const	double xu);
+    SignedGraphForMIP greedy_switching(const GreedyKickOptions& opts);
+    SignedGraphForMIP greedy_switching();
+	// Rebuild current state from a new x̂ (overwrites current s_, weights)
+	void reseed_switching(const std::vector<double>& xhat);
+	inline double get_x(int u) { return (s_[u]+1.0)/2.0; }
+	inline double get_y(int u, int v) { return get_x(u)*get_x(v); }
+	inline double get_y(Edge uv) { return get_y(uv.first, uv.second); }
+	
     // Public “finder” APIs (now wrappers over the stream)
     std::vector<NegativeCycle> find_switched_lower_bound(bool cover = false);
     std::vector<std::vector<NegativeCycle>> find_switched_lower_bound_grouped(bool cover) const;

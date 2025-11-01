@@ -10,8 +10,8 @@ ModularityModel::ModularityModel(SignedGraphForMIP& g, int cut_flags)
     : FrustrationModelXY(*(new SignedGraphForMIP(&g, [&]() {
         std::cerr << "[ModularityModel] Computing modularity weights..." << std::endl;
 
-        const auto& d_plus = g.plus_degrees_view();
-        const auto& d_minus = g.minus_degrees_view();
+        const auto& d_plus = g.get_plus_degrees();
+        const auto& d_minus = g.get_minus_degrees();
 
         double m_plus = 0.0, m_minus = 0.0;
         for (int d : d_plus) m_plus += d;

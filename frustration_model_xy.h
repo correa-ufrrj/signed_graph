@@ -48,13 +48,8 @@ public:
     void set_fractional_phase_enabled(bool on) { fractional_phase_enabled_ = on; }
     bool fractional_phase_enabled() const { return fractional_phase_enabled_; }
 
-    // Convenience: run driver using current LP solution (x̂,ŷ) from CPLEX
-	TriangleCyclePipeline::Result run_pipeline_round_from_lp(const LpAccessor& acc);
-
     // Helper to extract current LP solution to plain vectors
-	void snapshot_lp_solution(const LpAccessor& acc,
-	                          std::vector<double>& xhat,
-	                          std::vector<double>& yhat) const;
+	void snapshot_lp_solution(const LpAccessor& acc) const;
 
     // Clear & reinit the persistent separation state (ω←1, H←0, pool_count←0, de-dup cleared).
     void reset_separation_state();
@@ -74,8 +69,14 @@ public:
 
 private:
     // ========================== Variables & bookkeeping ======================
-    std::vector<IloBoolVar> x;   // vertex binaries
-    std::vector<IloNumVar>  y;   // edge binaries (undirected)
+    IloNumVarArray x;   // vertex binaries
+    IloNumVarArray y;   // edge binaries (undirected)
+    
+    mutable IloNumArray    		xval;
+    mutable std::vector<double> xhat;
+    
+	int    sym_vstar = -1;
+	double sym_xfix  = 0.0;
 
     // Global policy for callback: Fractional vs Build phase
     bool fractional_phase_enabled_ = true;
@@ -92,6 +93,7 @@ private:
 
     // ============================ Cut builders ===============================
     IloRange generate_cycle_cut_standard(IloEnv& env, const std::vector<Edge>& all_edges) const;
+	IloRange generate_cycle_cut_reversed(IloEnv& env, const std::vector<Edge>& all_edges) const;
     std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) override;
 
 public:

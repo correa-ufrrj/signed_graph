@@ -15,8 +15,8 @@ void FrustrationModelX::build() {
         x[i] = IloBoolVar(env, ("x_" + std::to_string(i)).c_str());
     z = IloNumVar(env, "z");
 
-    const auto& d_plus = graph.plus_degrees_view();
-    const auto& d_minus = graph.minus_degrees_view();
+    const auto& d_plus = graph.get_plus_degrees();
+    const auto& d_minus = graph.get_minus_degrees();
 
     IloExpr obj_expr(env);
     obj_expr += z;
@@ -26,8 +26,8 @@ void FrustrationModelX::build() {
     obj_expr.end();
 
     // Initial solution using greedy switching
-    graph.restore_switched_sign();
-    std::vector<int> s = graph.greedy_switching();
+	SignedGraph sg_sw = graph.greedy_switching();       // switched graph (by value)
+	const auto& s = sg_sw.switching_vector();           // std::vector<double>, values in [-1,+1]
 
     // Improving inequalities, if required
     if (use_cut_generator != NO_CUTS) {
@@ -102,7 +102,7 @@ void FrustrationModelX::build() {
         start_vals.add(static_cast<IloNum>(s[i]));
     }
 
-    auto fe = graph.frustrated_edges(s);
+    auto fe = graph.frustrated_edges();
     std::cout << "fe = " << fe << std::endl;
     model.add(z);
     vars.add(z);

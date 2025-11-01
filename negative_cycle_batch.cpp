@@ -3,6 +3,7 @@
 #include "separation_pipeline_tls.h"
 #include <unordered_set>
 #include <algorithm>
+#include <numeric>
 #include <chrono>
 #include <limits>
 #include <cstdint>
@@ -51,40 +52,6 @@ static inline long long key64_pair(int a, int b) {
 // -------------------------------------------------------------------------
 
 NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
-                                       bool cover,
-                                       bool use_triangle_order)
-    : NegativeCycleBatch(G, cover, use_triangle_order, Params{}) {}
-
-NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
-                                       bool cover,
-                                       bool /*use_triangle_order*/,
-                                       Params p)
-    : P_(p), G_(G), cover_(cover)
-{
-    tri_cap_per_vertex_ = P_.tri_cap_per_vertex;
-    build_initial_state_();
-}
-
-// NEW utility used by the compat constructors
-std::vector<Edge>
-NegativeCycleBatch::collect_all_negatives_(const SignedGraphForMIP& G) {
-    std::vector<Edge> out;
-    out.reserve((size_t)G.edge_count()/3);
-    const auto& sw = G.get_switched_weight();
-    const auto& sv = G.signs_view();
-    const int m = G.edge_count();
-    for (int eid = 0; eid < m; ++eid) {
-        if (sw[eid] < 0.0) {
-            const int u = (int)sv[eid].points.first;
-            const int v = (int)sv[eid].points.second;
-            out.emplace_back(u, v);
-        }
-    }
-    return out;
-}
-
-// REFACTORED main constructor
-NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
                                        const std::vector<Edge>& neg_edges_uncov,
                                        bool cover,
                                        Params p)
@@ -98,6 +65,22 @@ NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
 
 // REFACTORED: this no longer fills neg_edges_ from the graph.
 // It builds positive graph, base weights, and then computes neg degrees from the provided anchors.
+// Delegating convenience constructors (compat overloads)
+NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
+                                       bool cover,
+                                       bool use_triangle_order)
+    : NegativeCycleBatch(G, G.get_negative_edges(), cover, Params{}) {}
+
+NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
+                                       bool cover,
+                                       bool /*use_triangle_order*/,
+                                       Params p)
+    : P_(p), G_(G), cover_(cover) {
+    tri_cap_per_vertex_ = P_.tri_cap_per_vertex;
+    neg_edges_ = G.get_negative_edges();
+    build_initial_state_();
+}
+
 void NegativeCycleBatch::build_initial_state_() {
     vcount_ = G_.vertex_count();
     ecount_ = G_.edge_count();
@@ -108,18 +91,52 @@ void NegativeCycleBatch::build_initial_state_() {
     pos_deg_.assign((size_t)vcount_, 0);
 
     const auto& signs_view = G_.signs_view();
-    const auto& sw         = G_.get_switched_weight();
+    const auto& w          = G_.get_weights();
+
+    if (w.empty()) {
+        std::cout << "[INIT-NegativeCycleBatch] weights are empty\n";
+    } else {
+        // min / max
+        const auto [it_min, it_max] = std::minmax_element(w.begin(), w.end());
+        const double w_min   = *it_min;
+        const double w_max   = *it_max;
+
+        // mean
+        const double w_mean  = std::accumulate(w.begin(), w.end(), 0.0) / static_cast<double>(w.size());
+
+        // median
+        double w_median = 0.0;
+        {
+            std::vector<double> tmp(w.begin(), w.end());
+            auto mid = tmp.begin() + tmp.size() / 2;
+            std::nth_element(tmp.begin(), mid, tmp.end());
+            if (tmp.size() % 2 == 1) {
+                w_median = *mid;
+            } else {
+                auto mid2 = tmp.begin() + (tmp.size() / 2 - 1);
+                std::nth_element(tmp.begin(), mid2, tmp.end());
+                w_median = (*mid + *mid2) / 2.0;
+            }
+        }
+
+        std::cout << "[INIT-NegativeCycleBatch] w-max=" << w_max
+                  << ", w-min=" << w_min
+                  << ", w-mean=" << w_mean
+                  << ", w-median=" << w_median
+                  << std::endl;
+    }
 
     std::vector<double> pos_bases; pos_bases.reserve((size_t)ecount_);
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
         const auto se = signs_view[eid];
-        const double w = sw[eid];
-        if (w > 0.0) {
-            base_pos_[(size_t)eid] = std::max(1e-12, std::fabs(w));
+        const double we = w[eid];
+        if (we > 0.0) {
+
+            base_pos_[(size_t)eid] = std::max(1e-12, std::fabs(we));
             pos_bases.push_back(base_pos_[(size_t)eid]);
             ++pos_deg_[(size_t)se.points.first];
             ++pos_deg_[(size_t)se.points.second];
-        } else if (w == 0.0) {
+        } else if (we == 0.0) {
             base_pos_[(size_t)eid] = 1e-12;
             pos_bases.push_back(1e-12);
             ++pos_deg_[(size_t)se.points.first];
@@ -142,7 +159,7 @@ void NegativeCycleBatch::build_initial_state_() {
     pos2full_eid_.clear(); pos2full_eid_.reserve((size_t)ecount_);
 
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        if (!edge_is_pos(eid)) continue;
+        if (G_.is_neg_edge(eid)) continue;
         const auto se = signs_view[eid];
         igraph_integer_t u = se.points.first, v = se.points.second;
         full2pos_eid_[(size_t)eid] = (igraph_integer_t)pos2full_eid_.size();
@@ -160,8 +177,13 @@ void NegativeCycleBatch::build_initial_state_() {
     if (saved_weights_pos_init_) igraph_vector_destroy(&saved_weights_pos_);
     igraph_vector_init(&saved_weights_pos_, (long)pos2full_eid_.size());
     for (long pe = 0; pe < (long)pos2full_eid_.size(); ++pe) {
-        igraph_integer_t fe = pos2full_eid_[pe];
-        VECTOR(saved_weights_pos_)[pe] = base_pos_[(size_t)fe];
+        const igraph_integer_t fe = pos2full_eid_[pe];
+        double val = base_pos_[(size_t)fe];
+        if (P_.guide_len_full) {
+            const double g = (*(P_.guide_len_full))[(size_t)fe];
+            val = std::max(P_.guide_len_eps, g);
+        }
+        VECTOR(saved_weights_pos_)[pe] = val;
     }
     saved_weights_pos_init_ = true;
 
@@ -202,18 +224,24 @@ void NegativeCycleBatch::build_pos_adj_and_index_(
     TriangleBucketBatch::PosAdj& pos_adj,
     TriangleBucketBatch::EdgeIndex& edge_index) const
 {
+    // Reset adjacency for |V|
     pos_adj.assign((size_t)vcount_, {});
-    const auto& signs_view = G_.signs_view();
-    const auto& sw = G_.get_switched_weight();
+    edge_index.clear();
 
-    // Map all edges to full-eid; only positive edges go to adjacency
+    const auto& sv = G_.signs_view();
+
+    // Map every (u,v) -> full eid; add only positive edges to adjacency
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        const auto se = signs_view[eid];
-        igraph_integer_t u = se.points.first, v = se.points.second;
-        edge_index.emplace(key64_pair((int)u,(int)v), (int)eid);
-        if (sw[eid] > 0.0) {
-            pos_adj[(size_t)u].push_back((int)v);
-            pos_adj[(size_t)v].push_back((int)u);
+        const auto se = sv[eid];
+        const int u = (int)se.points.first;
+        const int v = (int)se.points.second;
+
+        edge_index.emplace(key64_pair(u, v), (int)eid);
+
+        // Positive means (>0) OR (+0). (−0) is treated as negative.
+        if (G_.is_pos_edge(eid)) {
+            pos_adj[(size_t)u].push_back(v);
+            pos_adj[(size_t)v].push_back(u);
         }
     }
 }
@@ -386,6 +414,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	    }
 	
 	    // --- Two-pass selection -------------------------------------------
+	    const auto& sv = G_.signs_view();
 	    std::vector<int> sp_used_per_vertex((size_t)vcount_, 0);
 	    auto try_accept = [&](int neg_full_eid, const SPCand& c) -> bool {
 	        // Vertex-cap test
@@ -397,8 +426,8 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	        // Triangle cap accounting for 2-pos-edge cycles
 	        if (c.L == 3) {
 	            // infer w and count using tri caps
-	            const int uu = G_.signs_view()[neg_full_eid].points.first;
-	            const int vv = G_.signs_view()[neg_full_eid].points.second;
+	            const int uu = sv[neg_full_eid].points.first;
+	            const int vv = sv[neg_full_eid].points.second;
 	            int w = -1;
 	            if (!c.nodes.empty()) {
 	                // path nodes are [u, w, v]
@@ -422,7 +451,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	        }
 	
 	        // Materialize the cycle
-	        const auto& se = G_.signs_view()[neg_full_eid];
+	        const auto& se = sv[neg_full_eid];
 			std::vector<Edge> path = c.pos_path; // copy then move (candidate is const)
 			out.emplace_back(Edge{(int)se.points.first,(int)se.points.second}, std::move(path));
 	        ++total_found_; ++cycles_emitted_now;

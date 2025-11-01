@@ -1,3 +1,4 @@
+// separation_pipeline.h
 #pragma once
 
 #include <vector>
@@ -75,7 +76,6 @@ struct SeparationRound {
     void clear() {
         emitted_triangles = emitted_cycles = 0;
         selected_count_full.clear();
-        sal_full.clear();
         omega_prime_pos.clear();
         used_in_batch_pos.clear();
     }
@@ -106,10 +106,8 @@ struct RoundSwitching {
 
 class TriangleCyclePipeline {
 public:
-    enum class Phase { Build, Fractional };
 
-    TriangleCyclePipeline(SignedGraphForMIP& G,
-                          SeparationPersistent& persistent,
+    TriangleCyclePipeline(SeparationPersistent& persistent,
                           SeparationConfig cfg = {});
 
     // STEP 1: shell only; returns an empty set. Later steps will fill it.
@@ -119,19 +117,10 @@ public:
         int cycles_accepted    = 0;
     };
 
-    // One-shot: on next run_round(), reuse whatever switching is already set
-    // on the SignedGraph (skip restore+greedy). Thread-local guard lives in the .cpp.
-    void reuse_current_switching_once();
-
-    Result run_round(const std::vector<double>* x_hat,
-                     const std::vector<double>* y_hat,
-                     Phase phase);
+    Result run_round(const SignedGraphForMIP& G_);
 
     const SeparationRound& round() const { return round_; }
     SeparationRound&       round()       { return round_; }
-
-    // Precompute full↔pos id maps for current switching; called at round start
-    void rebuild_pos_maps();
 
 private:
 
@@ -164,9 +153,8 @@ private:
     friend void ::TBB_on_accept(int, double);
     friend int  ::TBB_budget_override(int);
     // Core references
-    SignedGraphForMIP& G_;
-    SeparationPersistent&    S_;
-    SeparationConfig         C_;
+    SeparationPersistent&   S_;
+    SeparationConfig        C_;
 
     // Per-round scratch
     SeparationRound          round_;
@@ -174,14 +162,15 @@ private:
     // Full↔pos mapping under *current* switching (rebuilt each round)
     RoundGraphView Gt_;
 
+    // Precompute full↔pos id maps for current switching; called at round start
+    void rebuild_pos_maps(const SignedGraphForMIP& G_);
+
     // === Step-2+ stubs (no-ops in step 1) ===
-    void build_salience_(const std::vector<double>* x_hat,
-                         const std::vector<double>* y_hat);
     void build_omega_prime_pos_();
     void pre_enumeration_reheat_();
-    void triangle_stage_();
-    void sp_stage_();
-    void commit_stage_();
+    void triangle_stage_(const SignedGraphForMIP& G_);
+    void sp_stage_(const SignedGraphForMIP& G_);
+    void commit_stage_(const SignedGraphForMIP& G_);
     void resize_round_pos_arrays_(int m_pos);
     void resize_round_full_arrays_(int m_full);    
 };

@@ -11,44 +11,34 @@
 // Constructors / destructor
 // ─────────────────────────────────────────────────────────────
 
-SignedGraphForMIP::SignedGraphForMIP(const SignedGraph* const other)
+SignedGraphForMIP::SignedGraphForMIP(const SignedGraphForMIP* const other)
     : SignedGraph(other),
-      frac_weights(other->edge_count(), 0.0),
-      mask_weights(other->edge_count(), 0.0) {
-    // Build local edge -> eid map (canonicalized Edge keys)
-    const auto& edge_map = this->edge_index();
-    for (const auto& kv : edge_map) {
-        const Edge& e = kv.first;
-        igraph_integer_t eid = kv.second;
-        edge_to_eid[e] = eid;
-    }
+	   reference_s_(other->reference_s_),
+	   reference_weights_(other->reference_weights_) {
+    is_switching_ = true;
 }
 
-SignedGraphForMIP::SignedGraphForMIP(const SignedGraph* const other, std::vector<double> new_weights)
-    : SignedGraph(other, std::move(new_weights)),
-      frac_weights(other->edge_count(), 0.0),
-      mask_weights(other->edge_count(), 0.0) {
-    const auto& edge_map = this->edge_index();
-    for (const auto& kv : edge_map) {
-        const Edge& e = kv.first;
-        igraph_integer_t eid = kv.second;
-        edge_to_eid[e] = eid;
-    }
+SignedGraphForMIP::SignedGraphForMIP(const SignedGraphForMIP* const other, std::vector<double> new_weights)
+    : SignedGraph(other, new_weights),
+	   reference_s_(other->reference_s_),
+	   reference_weights_(other->reference_weights_) {
+    is_switching_ = true;
+}
+
+SignedGraphForMIP::SignedGraphForMIP(const SignedGraphForMIP* const other,
+                                     std::vector<double> new_weights,
+                                     std::vector<double> new_s)
+: SignedGraph(other, std::move(new_weights), std::move(new_s)),
+  reference_s_(other->reference_s_),
+  reference_weights_(other->reference_weights_)
+{
+    is_switching_ = true;
 }
 
 SignedGraphForMIP::SignedGraphForMIP(const std::string& file_path)
-    : SignedGraph(file_path) {
-    const igraph_integer_t m = edge_count();
-    // Build local edge -> eid map (canonicalized Edge keys)
-    for (igraph_integer_t eid = 0; eid < m; ++eid) {
-        igraph_integer_t u, v;
-        igraph_edge(&g, eid, &u, &v);
-        edge_to_eid[Edge{static_cast<int>(u), static_cast<int>(v)}] = eid;
-    }
-    // Initialize working arrays
-    frac_weights.assign((size_t)m, 0.0);
-    mask_weights.assign((size_t)m, 0.0);
-    salience_full_.clear();
+    : SignedGraph(file_path),
+      reference_s_(s_), reference_weights_(weights_) {
+    is_switching_ = true;
 }
 
 SignedGraphForMIP::~SignedGraphForMIP() = default;
@@ -57,80 +47,77 @@ SignedGraphForMIP::~SignedGraphForMIP() = default;
 // Fractional guidance → salience (edge-aligned)
 // ─────────────────────────────────────────────────────────────
 
-bool SignedGraphForMIP::weighting_from_fractional(const std::vector<double>& x,
-                                                  const std::vector<double>& y) {
-    const igraph_integer_t m = edge_count();
-    if ((int)frac_weights.size() != m)   frac_weights.assign((size_t)m, 0.0);
-    if ((int)mask_weights.size() != m)   mask_weights.assign((size_t)m, 0.0);
-    // keep salience_full_ empty; edge_salience_view() will return mask_weights if empty
+SignedGraphForMIP SignedGraphForMIP::integer_projection() const {
+    const int n = vertex_count();
+    const int m = edge_count();
 
-    const auto signs = signs_view();
-
-    bool changed = false;
-    for (igraph_integer_t eid = 0; eid < m; ++eid) {
-        igraph_integer_t u, v; igraph_edge(&g, eid, &u, &v);
-        const int s = signs[eid].sign; // ±1
-
-        // τ(x,y) = 4y_uv − 2x_u − 2x_v + 1 ∈ [-1,1]
-        const double tau = 4.0 * y[(size_t)eid]
-                         - 2.0 * ((size_t)u < x.size() ? x[(size_t)u] : 0.0)
-                         - 2.0 * ((size_t)v < x.size() ? x[(size_t)v] : 0.0)
-                         + 1.0;
-
-        // fractional "weight" in [0,2], then map to [0,1]
-        const double frac = 1.0 - tau * static_cast<double>(s); // ∈ [0,2]
-        frac_weights[(size_t)eid] = frac;
-
-        const double t01 = 0.5 * frac; // ∈ [0,1]
-        // salience: 1 at 0.5, fades to 0 at 0 or 1
-        double sal = 1.0 - std::min(1.0, 2.0 * std::fabs(t01 - 0.5));
-        if (sal < 0.0) sal = 0.0;
-        if (sal > 1.0) sal = 1.0;
-        mask_weights[(size_t)eid] = sal;
-
-        // crude change detector (optional, used by callers heuristically)
-        const double y_hat = ( (size_t)u < x.size() && (size_t)v < x.size() )
-                           ? (x[(size_t)u] * x[(size_t)v])
-                           : 0.0;
-        if (std::fabs(y[(size_t)eid] - y_hat) > 1e-5) changed = true;
+    std::vector<double> s_int(n);
+    for (int u = 0; u < n; ++u) {
+        s_int[u] = (s_[u] >= 0.0) ? +1.0 : -1.0; // round to {±1}
     }
-    return changed;
+
+//	const auto s = signs_view();
+    std::vector<double> sigma_int(m);
+    for (int eid = 0; eid < m; ++eid) {
+		igraph_integer_t u, v; igraph_edge(g_.get(), eid, &u, &v);
+        const double w0 = reference_weights_[eid];         // ±1 from the base graph
+        sigma_int[eid] = s_int[(int)u] * w0 * s_int[(int)v];
+//		sigma_int[eid] = s[eid].sign; // σ_{s_int} = s_int ⊙ σ_s ⊙ s_int
+    }
+
+    SignedGraphForMIP sg(this, sigma_int, s_int);
+    sg.is_switching_ = true;
+    return sg;
+}
+
+void SignedGraphForMIP::align_switching(const int u, const double xfix01) {
+    const double xu = get_x(u);           // in {0,1}
+    std::cout << "[ALIGN] x[v*]=" << xu << " target=" << xfix01 << "\n";
+    if (std::fabs(xu - xfix01) > 1e-9) {
+        for (double& sv : s_) sv = -sv;   // global flip keeps edge signs unchanged
+    }
+    std::cout << "[ALIGNED] x[v*]=" << get_x(u) << " target=" << xfix01 << "\n";
 }
 
 // ─────────────────────────────────────────────────────────────
 // Switching helpers
 // ─────────────────────────────────────────────────────────────
 
-const std::vector<int> SignedGraphForMIP::greedy_switching() {
-    SignedGraph::GreedyKickOptions opts; // pure-integer pass
-    return this->greedy_switching_base(/*cmp_fn=*/nullptr, opts);
+SignedGraphForMIP SignedGraphForMIP::greedy_switching(const GreedyKickOptions& opts) {
+    SignedGraphForMIP sg(this, weights_, s_);
+    sg.is_switching_ = true;
+    sg.apply_greedy_switching(opts);
+    return sg;
 }
 
-std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching(const SignedGraph::GreedyKickOptions& user_opts) {
-    auto opts = user_opts; // copy (caller may have already set frac_x/frac_y)
-    auto sp = std::make_shared<const std::vector<int>>(
-        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
-    return sp;
+SignedGraphForMIP SignedGraphForMIP::greedy_switching() {
+    GreedyKickOptions opts; return greedy_switching(opts);
 }
 
-std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching() {
-    SignedGraph::GreedyKickOptions opts;
-    auto sp = std::make_shared<const std::vector<int>>(
-        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
-    return sp;
-}
+// Rebuild current state from a new x̂ (overwrites current s_, weights)
+void SignedGraphForMIP::reseed_switching(const std::vector<double>& xhat) {
+    if ((int)xhat.size() != vertex_count())
+        throw std::runtime_error("xhat size mismatch");
 
-std::optional<std::shared_ptr<const std::vector<int>>>
-SignedGraphForMIP::fractional_greedy_switching(const std::vector<double>& x,
-                                               const std::vector<double>& y) {
-    SignedGraph::GreedyKickOptions opts;
-    opts.frac_x = &x;
-    opts.frac_y = &y;
-    auto sp = std::make_shared<const std::vector<int>>(
-        this->greedy_switching_base(/*cmp_fn=*/nullptr, opts));
-    return sp;
+	weights_ = reference_weights_;
+    s_ = reference_s_;
+
+    // s = 2x̂ - 1
+    std::vector<double> s(vertex_count());
+    for (int u = 0; u < vertex_count(); ++u) {
+		s[u] = 2.0 * xhat[u] - 1.0;
+		if (xhat[u] >= 0.499 && xhat[u] <= 0.501) std::cout << "."; else std::cout << u;
+    }
+    std::cout  << "\n";
+    
+    std::cout << "[SWITCH-RESEED] before sum s_=" << std::accumulate(s_.begin(), s_.end(), 0.0)
+    		  << " before sum s=" << std::accumulate(s.begin(), s.end(), 0.0)
+    		  << " before sum xhat=" << std::accumulate(xhat.begin(), xhat.end(), 0.0)
+    		  << "\n";
+    apply_compose_switching(s);
+    
+    std::cout << "[SWITCH-RESEED] after sum s_=" << std::accumulate(s_.begin(), s_.end(), 0.0)
+    		  << "\n";
 }
 
 // ─────────────────────────────────────────────────────────────

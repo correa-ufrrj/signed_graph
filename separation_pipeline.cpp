@@ -68,6 +68,19 @@ static inline double median_of(std::vector<double> v) {
     return med;
 }
 
+// Put near other utils in this TU (static internal helpers)
+static double percentile_of(std::vector<double> v, double q01) {
+    if (v.empty()) return 0.0;
+    q01 = std::clamp(q01, 0.0, 1.0);
+    const size_t k = (size_t)std::floor(q01 * (v.size()-1));
+    std::nth_element(v.begin(), v.begin()+k, v.end());
+    return v[k];
+}
+
+static double safe_div(double num, double den) {
+    return (den > 0.0) ? (num / den) : 0.0;
+}
+
 static inline void log_vec_stats(const char* tag, const std::vector<double>& v) {
     auto [mn,mean,mx] = min_mean_max(v);
     std::cout << tag << " min=" << mn << " mean=" << mean << " max=" << mx << " size=" << v.size() << "\n";
@@ -76,6 +89,71 @@ static inline void log_vec_stats(const char* tag, const std::vector<double>& v) 
 template <typename T>
 static inline size_t count_nz(const std::vector<T>& a) {
     size_t c=0; for (const auto& x : a) if (x!=T{}) ++c; return c;
+}
+
+// --- Fast 64-bit hash for sign masks (no external deps) ---------------------
+// SplitMix64 mix (public-domain quality mix; good enough for probes)
+static inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x = x ^ (x >> 31);
+    return x;
+}
+
+// Generic reader: treats any mask/container with size() and operator[] as bytes (0/1)
+template <class Mask>
+uint64_t hash_sign_mask(const Mask& mask) {
+    const size_t n = mask.size();
+    const uint8_t* base = nullptr;
+
+    // If mask stores bytes contiguously, use them directly; otherwise copy cheaply.
+    std::vector<uint8_t> tmp; tmp.reserve(n);
+    if constexpr (std::is_pointer_v<decltype(mask.data())>) {
+        // Try to use data() if available and looks like bytes; otherwise fall back below.
+        using byte_t = std::remove_pointer_t<decltype(mask.data())>;
+        if constexpr (std::is_same_v<byte_t, uint8_t> || std::is_same_v<byte_t, unsigned char> || std::is_same_v<byte_t, char>) {
+            base = reinterpret_cast<const uint8_t*>(mask.data());
+        } else {
+            for (size_t i = 0; i < n; ++i) tmp.push_back(static_cast<uint8_t>(!!mask[i]));
+            base = tmp.data();
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) tmp.push_back(static_cast<uint8_t>(!!mask[i]));
+        base = tmp.data();
+    }
+
+    // Chunk fold 8 bytes → 64-bit and mix; then finalize like xxHash-style avalanche.
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(n);
+    size_t i = 0;
+    while (i + 8 <= n) {
+        uint64_t w =
+            (uint64_t)base[i+0]        |
+            (uint64_t)base[i+1] <<  8  |
+            (uint64_t)base[i+2] << 16  |
+            (uint64_t)base[i+3] << 24  |
+            (uint64_t)base[i+4] << 32  |
+            (uint64_t)base[i+5] << 40  |
+            (uint64_t)base[i+6] << 48  |
+            (uint64_t)base[i+7] << 56;
+        h ^= splitmix64(w + i);
+        // cheap rotate + multiply drift
+        h = (h << 27) | (h >> (64 - 27));
+        h = h * 0x165667919E3779F9ULL + 0x9E3779B97F4A7C15ULL;
+        i += 8;
+    }
+    // Tail
+    uint64_t tail = 0; int sh = 0;
+    while (i < n) { tail |= (uint64_t)base[i++] << sh; sh += 8; }
+    h ^= splitmix64(tail + n);
+
+    // Final avalanche (Murmur3 finalizer)
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= (h >> 33);
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= (h >> 33);
+    return h;
 }
 
 } // namespace
@@ -118,23 +196,16 @@ void TBB_clear_active() {
 // Thread-local so callbacks/threads don't interfere.
 static thread_local bool g_skip_switching_once = false;
 
-TriangleCyclePipeline::TriangleCyclePipeline(SignedGraphForMIP& G,
-                                             SeparationPersistent& persistent,
+TriangleCyclePipeline::TriangleCyclePipeline(SeparationPersistent& persistent,
                                              SeparationConfig cfg)
-    : G_(G), S_(persistent), C_(cfg)
+    : S_(persistent), C_(cfg)
 {
     // Ensure persistent edge-aligned arrays are sized
-    S_.init_sizes_if_needed(G_);
-    rebuild_pos_maps();
+//    S_.init_sizes_if_needed(G_);
+//    rebuild_pos_maps();
 }
 
-// Public: request that the next run_round() *reuses* the graph's current switching.
-// Implementation: set thread-local guard; run_round will skip restore+greedy.
-void TriangleCyclePipeline::reuse_current_switching_once() {
-    g_skip_switching_once = true;
-}
-
-void TriangleCyclePipeline::rebuild_pos_maps() {
+void TriangleCyclePipeline::rebuild_pos_maps(const SignedGraphForMIP& G_) {
     const int m = G_.edge_count();
 
     // Reset view
@@ -145,14 +216,12 @@ void TriangleCyclePipeline::rebuild_pos_maps() {
 
     // Build masks & maps from the CURRENT switched signature.
     Gt_.pos2full.reserve(m);
-    const auto& swv = G_.get_switched_weight();
     for (int eid = 0; eid < m; ++eid) {
-        const double sw = (eid < (int)swv.size() ? swv[eid] : 0.0);
-        if (sw > 0.0) {
+        if (G_.is_pos_edge(eid)) {
             Gt_.full2pos[eid] = (int)Gt_.pos2full.size();
             Gt_.pos2full.push_back(eid);
             Gt_.pos_mask[eid] = 1;
-        } else if (sw < 0.0) {
+        } else if (G_.is_neg_edge(eid)) {
             Gt_.neg_mask[eid] = 1;
         }
     }
@@ -203,9 +272,7 @@ void TriangleCyclePipeline::rebuild_pos_maps() {
 }
 
 TriangleCyclePipeline::Result
-TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
-                                 const std::vector<double>* y_hat,
-                                 Phase phase)
+TriangleCyclePipeline::run_round(const SignedGraphForMIP& G_)
 {
     // Keep persistent arrays in sync with |E| (defensive)
     S_.init_sizes_if_needed(G_);
@@ -242,25 +309,10 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
 	}
 
     // === 1) Choose switching s and apply it ===
-	bool wff_called = false; bool wff_changed = false;
-	bool skip_reswitch = g_skip_switching_once;
-	if (skip_reswitch) {
-	    // One-shot reuse of the *current* switching (set by caller).
-	    // Do NOT restore/sign or recompute; just consume and clear the flag.
-	    std::cout << "[SWITCH-GUARD] reuse_current_switching_once=1 (skipping re-switch)\n";
-	    g_skip_switching_once = false;
-	} else {
-	    G_.restore_switched_sign();
-	    if (phase == Phase::Fractional && x_hat && y_hat) {
-	        wff_called = true;
-	        wff_changed = G_.weighting_from_fractional(*x_hat, *y_hat);
-	    }
-	    auto s = G_.greedy_switching();
-	    G_.switching_from_partition(s);
-	}
+    // switching has been applied in the frustration model
 
     // === 2) Rebuild positive-subgraph maps under the new switching ===
-    rebuild_pos_maps();
+    rebuild_pos_maps(G_);
 
     // === Round-setup & switching probes ===
     {
@@ -268,10 +320,12 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
         const int neg_edges = (int)count_nz(Gt_.neg_mask);
         const int m_guard   = m;
         const int delta     = (pos_edges + neg_edges) - m_guard;
+	    const uint64_t sign_hash = hash_sign_mask(Gt_.neg_mask);
         std::cout << "[SWITCH-PROBE] |E+|=" << pos_edges
                   << " |E-|=" << neg_edges
                   << " m="   << m_guard
-                  << " guard_delta=" << delta << "\n";
+                  << " guard_delta=" << delta
+                  << " sign_hash=0x"  << std::hex << sign_hash << std::dec << "\n";
 
         // Per-vertex positive/negative degree top-5
         const int n = G_.vertex_count();
@@ -297,20 +351,12 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
     }
 
     // === Phase-difference probe (persistent arrays & LP knob) ===
-    std::cout << "[PHASE-PROBE] phase=" << (phase==Phase::Build?"Build":"Fractional")
-              << " lambda_LP=" << C_.ranking.lambda_LP
+    std::cout << "[PHASE-PROBE] lambda_LP=" << C_.ranking.lambda_LP
               << " Gt.m_pos=" << Gt_.m_pos << " m=" << m
-              << (wff_called?" wff_called=1":" wff_called=0")
-              << (wff_called?(wff_changed?" wff_changed=1":" wff_changed=0"):"")
               << "\n";
-    if (phase == Phase::Build) {
-        log_vec_stats("[PHASE-PROBE] omega", S_.omega);
-        log_vec_stats("[PHASE-PROBE] H", S_.H);
-        log_vec_stats("[PHASE-PROBE] pool_count", S_.pool_count);
-    }
 
-    // === 3) Build salience (FULL-edge array) ===
-    build_salience_(x_hat, y_hat);
+    // === 3) Build edge salience (FULL-edge array) ===
+    round_.sal_full = G_.edge_saliences();
 
     // Compute salience stats (with median & %zero)
     double sal_min, sal_mean, sal_max;
@@ -318,93 +364,35 @@ TriangleCyclePipeline::run_round(const std::vector<double>* x_hat,
         auto [mn,mean,mx] = min_mean_max(round_.sal_full);
         sal_min = mn; sal_mean = mean; sal_max = mx;
         size_t nz = 0; for (double v : round_.sal_full) if (v>0.0) ++nz;
+        size_t no = 0; for (double v : round_.sal_full) if (v>0.0 && v<1.0) ++no;
         const double p0 = round_.sal_full.empty()?0.0 : 100.0 * (double)(round_.sal_full.size()-nz) / (double)round_.sal_full.size();
+        const double f0 = round_.sal_full.empty()?0.0 : 100.0 * (double)(no) / (double)round_.sal_full.size();
         std::vector<double> tmp = round_.sal_full;
         double med = median_of(tmp);
         std::cout << "[PHASE-PROBE] salience stats min=" << sal_min
                   << " mean=" << sal_mean
                   << " median=" << med
                   << " max=" << sal_max
-                  << " zeros%=" << p0 << "%\n";
+                  << " zeros%=" << p0 << "%"
+                  << " fracs%=" << f0 << "%\n";
     }
 
     // === 4) Build working weights ω′ on E⁺ (includes λ_LP blend) ===
     build_omega_prime_pos_();
 
-    // Build-phase gating confirmation: λ_LP should have no effect (λ=0 or sal all zeros)
-    if (phase == Phase::Build) {
-        bool lambda_zero = (std::abs(C_.ranking.lambda_LP) <= 0.0);
-        bool sal_all_zero = std::all_of(round_.sal_full.begin(), round_.sal_full.end(),
-                                        [](double v){ return v==0.0; });
-        std::cout << "[BUILD-GUARD] LP_effect_off=" << ((lambda_zero||sal_all_zero)?1:0)
-                  << " reason=" << (lambda_zero ? "lambda_LP=0" : (sal_all_zero ? "zero-salience" : "LP-active-WARNING"))
-                  << "\n";
-    }
-
     // === Run stages ===
     pre_enumeration_reheat_();
-    triangle_stage_();
-    sp_stage_();
+    triangle_stage_(G_);
+    sp_stage_(G_);
 
     // === Commit persistent updates (ω/H/pool_count) ===
-    commit_stage_();
+    commit_stage_(G_);
 
     Result R{};
     R.triangles_accepted = (int)tri_selected_.size();
     R.cycles_accepted    = g_sp_cycles_accepted;
     R.accepted_keys      = std::move(accepted_keys_);
     return R;
-}
-
-void TriangleCyclePipeline::build_salience_(const std::vector<double>* x_hat,
-                                            const std::vector<double>* y_hat)
-{
-    const int m = G_.edge_count();
-    round_.sal_full.assign(m, 0.0);
-
-    // If both x̂ (per-vertex) and ŷ (per-edge) are available, compute:
-    // sal(uv) = min{1, 4 * | x[u]*x[v] - y[uv] | }.
-    if (x_hat && y_hat) {
-        const auto& x = *x_hat;
-        const auto& y = *y_hat;
-
-        const int n = G_.vertex_count();
-        if ((int)x.size() >= n && (int)y.size() >= m) {
-            const auto& sv = G_.signs_view();
-            for (int eid = 0; eid < m; ++eid) {
-                const int u = (int)sv[eid].points.first;
-                const int v = (int)sv[eid].points.second;
-
-                // safe fetch + light clamp to [0,1] (helps with tiny numerical drift)
-                const double xu  = std::min(1.0, std::max(0.0, x[u]));
-                const double xv  = std::min(1.0, std::max(0.0, x[v]));
-                const double yuv = std::min(1.0, std::max(0.0, y[eid]));
-
-                double s = 4.0 * std::fabs(xu * xv - yuv);
-                if (s > 1.0) s = 1.0;            // clamp to [0,1]
-                // s >= 0 by construction
-                round_.sal_full[eid] = s;
-            }
-            std::cout << "[SALIENCE] source=spec (4*|x_u x_v - y_uv|, clamped)\n";
-            return;
-        } else {
-            std::cout << "[SALIENCE-WARN] insufficient sizes for x̂/ŷ "
-                      << "(x=" << (int)x.size() << " vs n=" << G_.vertex_count()
-                      << ", y=" << (int)y.size() << " vs m=" << m
-                      << "). Falling back.\n";
-        }
-    }
-
-    // Fallback: use graph-prepared salience if present (e.g., from weighting_from_fractional()).
-    const std::vector<double>& gsal = G_.edge_salience_view();
-    if ((int)gsal.size() == m) {
-        round_.sal_full = gsal; // copy
-        std::cout << "[SALIENCE] source=edge_salience_view() (graph-prepared)\n";
-        return;
-    }
-
-    // Last resort: keep zeros.
-    std::cout << "[SALIENCE] source=none (zeros)\n";
 }
 
 void TriangleCyclePipeline::build_omega_prime_pos_()
@@ -542,7 +530,7 @@ void TriangleCyclePipeline::pre_enumeration_reheat_() {
 // (Reserved for later steps.)
 }
 
-void TriangleCyclePipeline::triangle_stage_() {
+void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
     // === Triangle-first via TriangleBucketBatch ===
     tri_selected_.clear();
     covered_neg_eids_.clear();
@@ -564,18 +552,41 @@ void TriangleCyclePipeline::triangle_stage_() {
 
     // Positive adjacency + list of negative anchors under current switching
     TriangleBucketBatch::PosAdj pos_adj(n);
-    std::vector<std::pair<int,int>> neg_edges;
-    neg_edges.reserve(m/2);
-    for (const auto& kv : G_.edge_index()) {
-        const Edge& e = kv.first; int eid = kv.second;
-        if (eid < 0 || eid >= (int)Gt_.pos_mask.size()) continue;
-        if (Gt_.pos_mask[eid]) {
+    {
+        // Build E⁺ adjacency from helper (current switched signature)
+        auto pos_edges = G_.get_positive_edges();
+        for (const auto& e : pos_edges) {
             pos_adj[e.first].push_back(e.second);
             pos_adj[e.second].push_back(e.first);
-        } else if (Gt_.neg_mask[eid]) {
-            neg_edges.emplace_back(e.first, e.second);
         }
     }
+    // Negative anchors (full edges) under current switching
+	auto neg_eids = G_.get_negative_eids();
+	std::vector<double> neg_sals;
+	neg_sals.reserve(neg_eids.size());
+	double mean = 0.0;
+	for (int feid : neg_eids) { double s = round_.sal_full[feid]; neg_sals.push_back(s); mean += s; }
+	const int neg_raw = (int)neg_eids.size();
+	mean = (neg_raw ? mean / neg_raw : 0.0);
+	
+	// F: p60 gate + mean fallback
+	const double p60 = percentile_of(neg_sals, 0.60);
+	const double sal_min_fallback = std::max(p60, 0.5 * mean);
+	
+	std::vector<Edge> neg_edges;                 // FIX: no pre-size
+	neg_edges.reserve(neg_eids.size() / 1.5);          // capacity only
+	const auto& sv = G_.signs_view();
+	int nsel = 0;
+	for (int feid : neg_eids) {
+	    if (round_.sal_full[feid] < sal_min_fallback) continue;  // skip anchors not fractional enough
+	    const auto& p = sv[feid].points;
+	    neg_edges.emplace_back((int)p.first, (int)p.second);
+	    ++nsel;
+	}
+	
+	std::cout << "[TBB-FILTER] negE_raw=" << neg_raw
+	          << " negE_keep=" << nsel
+	          << " sal_fallback=" << sal_min_fallback << " (p60=" << p60 << ", mean=" << mean << ")\n";
 
     // Params from config (respect defaults)
     TriangleBucketBatch::Params P = C_.to_tbb_params();
@@ -600,16 +611,23 @@ void TriangleCyclePipeline::triangle_stage_() {
 	    const int pid_wv = (c.pos_eid_wv >= 0 && c.pos_eid_wv < (int)Gt_.full2pos.size())
 	                       ? Gt_.full2pos[c.pos_eid_wv] : -1;
 	
-	    const auto inv = [&](int pid)->double{
-	        if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return 0.0;
-	        return 1.0 / std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
-	    };
+//	    const auto inv = [&](int pid)->double{
+//	        if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return 0.0;
+//	        return 1.0 / std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
+//	    };
+const double p = (C_.ranking.inv_power > 0 ? C_.ranking.inv_power : 2.0);
+const auto inv = [&](int pid)->double{
+    if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return 0.0;
+    return std::pow( std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]), -p );
+};
 	
 	    // inverse harmonic mean (average of inverses)
-	    double inv_sum = 0.0; int k = 0;
-	    if (pid_uw >= 0) { inv_sum += inv(pid_uw); ++k; }
-	    if (pid_wv >= 0) { inv_sum += inv(pid_wv); ++k; }
-	    const double inv_hmean = (k > 0) ? (inv_sum / (double)k) : 0.0;
+//	    double inv_sum = 0.0; int k = 0;
+//	    if (pid_uw >= 0) { inv_sum += inv(pid_uw); ++k; }
+//	    if (pid_wv >= 0) { inv_sum += inv(pid_wv); ++k; }
+//	    const double inv_hmean = (k > 0) ? (inv_sum / (double)k) : 0.0;
+
+	    const double inv_hmean = (pid_uw >= 0 && pid_wv >= 0) ? inv(sqrt(pid_uw*pid_wv)) : 0.0;
 	
 	    auto sal = [&](int eid){
 	        return (eid >= 0 && eid < (int)round_.sal_full.size()) ? round_.sal_full[eid] : 0.0;
@@ -648,14 +666,11 @@ void TriangleCyclePipeline::triangle_stage_() {
     int covered_count  = 0;
     {
         TBBHookScope scope(static_cast<void*>(this), emit_cb, accept_cb, budget_cb);
-        std::vector<int> covered; // full eids of negative anchors with nonempty buckets
-        const auto& sel = tbb.select(covered);
-
-        // Persist outputs in round storage
-        covered_neg_eids_.assign(covered.begin(), covered.end());
-        covered_count = (int)covered_neg_eids_.size();
-
-        tri_selected_.reserve(sel.size());
+		std::vector<int> anchors_with_candidates;            // for telemetry only
+		const auto& sel = tbb.select(anchors_with_candidates);
+		
+		// Persist SELECTION and compute the set of SELECTED anchors for gating
+		tri_selected_.reserve(sel.size());
         for (const auto& c : sel) {
             TriAcc r;
             r.u = c.u; r.v = c.v; r.w = c.w;
@@ -667,21 +682,38 @@ void TriangleCyclePipeline::triangle_stage_() {
             r.viol = c.viol; r.phi = c.phi;
             tri_selected_.push_back(std::move(r));
         }
-        selected_count = (int)tri_selected_.size();
-    }
+		selected_count = (int)tri_selected_.size();
+		
+		// covered_by_tri := anchors of triangles that were actually SELECTED this round
+		covered_neg_eids_.clear();
+		covered_neg_eids_.reserve(tri_selected_.size());
+		{
+		    std::unordered_set<int> seen;
+		    for (const auto& r : tri_selected_) {
+		        if (seen.insert(r.neg_eid).second)
+		            covered_neg_eids_.push_back(r.neg_eid);
+		    }
+		}
+		
+		// Keep candidates count for probes
+		const int candidates_count = (int)anchors_with_candidates.size();
+		const int selected_anchor_count = (int)covered_neg_eids_.size();
+		std::cout << "[TBB-GATE-PROBE] candidates=" << candidates_count
+		          << " selected_anchors=" << selected_anchor_count
+		          << " (delta=" << (candidates_count - selected_anchor_count) << ")\n";
 
-    // After selection, log final TBB stats and acceptance rate
-    {
+	    // After selection, log final TBB stats and acceptance rate
         const auto& ST = tbb.stats();
         const int B_eff = (ST.B_eff > 0 ? ST.B_eff : P.B_tri);
         const double acc_rate_vs_budget = (B_eff > 0) ? (100.0 * (double)selected_count / (double)B_eff) : 0.0;
         const double acc_rate_vs_buckets = (ST.buckets_nonempty > 0) ? (100.0 * (double)selected_count / (double)ST.buckets_nonempty) : 0.0;
-        std::cout << "[TBB-SELECT] selected=" << selected_count
-                  << " B_eff=" << B_eff
-                  << " acc_rate_vs_budget=" << acc_rate_vs_budget << "% "
-                  << "acc_rate_vs_buckets=" << acc_rate_vs_buckets << "% "
-                  << "covered_neg=" << covered_count
-                  << "\n";
+		std::cout << "[TBB-SELECT] selected=" << selected_count
+		          << " B_eff=" << B_eff
+		          << " acc_rate_vs_budget=" << acc_rate_vs_budget << "% "
+		          << "acc_rate_vs_buckets=" << acc_rate_vs_buckets << "% "
+		          << "anchors_with_candidates=" << candidates_count
+		          << " anchors_selected=" << selected_anchor_count
+		          << "\n";
     }
 
     round_.emitted_triangles = selected_count;
@@ -704,13 +736,19 @@ void TriangleCyclePipeline::triangle_stage_() {
 		S_.bar_v_triangle = (1.0 - tau) * S_.bar_v_triangle + tau * v_round;
 		
 		// Previous effective budget (boot from base if unset)
-		const int   base_B = C_.budget.B_tri;
+		const int base_B = C_.budget.B_tri;
 		const int prev_B = (S_.B_tri_cur > 0 ? S_.B_tri_cur : base_B);
 		
 		// Map to γ in (gamma_min, gamma_max) with higher v → smaller γ
 		const double ratio = std::clamp(S_.bar_v_triangle / std::max(1e-12, A.v0), 0.0, 1.0);
 		double gamma = A.gamma_max - (A.gamma_max - A.gamma_min) * ratio;
 		gamma = std::min(gamma, 0.9995); // never ≥ 1
+		
+		// Extra shrink if the batch was underutilized
+		double util = (P.B_tri > 0) ? (double)selected_count / (double)P.B_tri : 0.0;
+		// If very few were selected relative to the budget, shrink harder.
+		if (util < 0.30) gamma *= 0.97;   // +3% extra shrink
+		if (util < 0.15) gamma *= 0.94;   // +6% extra shrink
 		
 		// Gentle multiplicative step
 		int b_next = (int)std::floor(prev_B * gamma + 1e-9);
@@ -720,11 +758,11 @@ void TriangleCyclePipeline::triangle_stage_() {
 		if (selected_count == 0) ++zero_streak; else zero_streak = 0;
 		
 		// Keep a small soft floor for a while
-		const int soft_floor = std::max(A.B_min, std::max(1, base_B / 32)); // e.g., 512→16
+		const int soft_floor = std::max(A.B_min, std::max(1, base_B / 64)); // e.g., 512→16
 		b_next = std::max(soft_floor, b_next);
 		
 		// If we keep selecting nothing at/near the floor, turn it off
-		const int patience = 3; // rounds at/near floor with zero selections
+		const int patience = 2; // rounds at/near floor with zero selections
 		if (b_next <= soft_floor && zero_streak >= patience) {
 		    S_.B_tri_cur = 0; // hard-off
 		    std::cout << "[ANNEAL] hard-off: floor=" << soft_floor
@@ -754,22 +792,52 @@ void TriangleCyclePipeline::triangle_stage_() {
     }
 }
 
-void TriangleCyclePipeline::sp_stage_() {
+void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
     g_sp_cycles_accepted = 0;
 
     // Build uncovered negatives = graph negatives \ covered_neg_eids_
     const auto edge_idx = G_.edge_index();
     std::unordered_set<int> covered_set(covered_neg_eids_.begin(), covered_neg_eids_.end());
-
-    std::vector<Edge> neg_uncov;
-    neg_uncov.reserve(covered_set.size() + 16);
-
-    for (const auto& kv : G_.edge_index()) {
-        const Edge& e = kv.first; int feid = kv.second;
-        if (!Gt_.neg_mask[feid]) continue;      // only negatives under current switching
-        if (covered_set.count(feid)) continue;  // skip anchors covered by triangle stage
-        neg_uncov.push_back(e);
-    }
+    
+	auto neg_eids_all = G_.get_negative_eids();
+	std::vector<double> neg_sals;
+	neg_sals.reserve(neg_eids_all.size());
+	double mean = 0.0;
+	double max = 0.0, min = 1.0;
+	for (int feid : neg_eids_all) {
+		double s = round_.sal_full[feid];
+		neg_sals.push_back(s);
+		mean += s;
+		if (s > max) max = s;
+		if (s < min) min = s;
+	}
+	const int neg_raw = (int)neg_sals.size();
+	mean = (neg_raw ? mean / neg_raw : 0.0);
+	
+	const double p60 = percentile_of(neg_sals, 0.6);
+	const double sal_min_fallback = std::max(p60, 0.5 * mean);
+	
+	// Build uncovered list:
+	std::vector<Edge> neg_uncov; neg_uncov.reserve(neg_eids_all.size());
+	const auto& sv = G_.signs_view();
+	int kept = 0;
+	for (int feid : neg_eids_all) {
+	    if (covered_set.count(feid)) continue;
+	    if (round_.sal_full[feid] < sal_min_fallback - 1e-07) continue;
+	    const auto& p = sv[feid].points;
+	    if (fabs(G_.vertex_salience((int)p.first)+G_.vertex_salience((int)p.second)) < 1e-07) continue;
+	    neg_uncov.emplace_back((int)p.first, (int)p.second);
+	    ++kept;
+	}
+	
+	const int covered = (int)covered_set.size();
+	const double denom = std::max(1.0, (double)(neg_raw - covered));
+	std::cout << "[SP-GATE] neg_raw=" << neg_raw
+	          << " covered_by_tri=" << covered
+	          << " kept_for_sp=" << kept
+	          << " sal_min=" << sal_min_fallback
+	          << " keep_rate=" << std::fixed << std::setprecision(2) << (100.0 * (kept / denom))
+	          << "% (min=" << min << ", max=" << max << ", p60=" << p60 << ", mean=" << mean << ")\n";
 
     NegativeCycleBatch ncb(G_, neg_uncov, /*cover=*/false, C_.to_ncb_params());
 
@@ -790,7 +858,7 @@ void TriangleCyclePipeline::sp_stage_() {
     round_.emitted_cycles = g_sp_cycles_accepted;
 }
 
-void TriangleCyclePipeline::commit_stage_() {
+void TriangleCyclePipeline::commit_stage_(const SignedGraphForMIP& G_) {
     // ── Persistent updates (ω, H via EMA, pool_count) ───────────
     const int m = G_.edge_count();
     S_.init_sizes_if_needed(G_);
@@ -927,5 +995,4 @@ void TriangleCyclePipeline::resize_round_pos_arrays_(int m_pos) {
 
 void TriangleCyclePipeline::resize_round_full_arrays_(int m_full) {
     round_.selected_count_full.assign(m_full, 0.0);
-    round_.sal_full.assign(m_full, 0.0);
 }

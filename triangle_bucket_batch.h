@@ -11,6 +11,7 @@
 #include <tuple>
 #include <functional>
 #include <utility>
+#include <edge.h>
 
 // Design:
 //  - Iterate negative edges (anchors) under the *current switched signs*
@@ -89,7 +90,7 @@ public:
 	// pos_adj  : adjacency of G^+_σ
 	// edge_index: map (min(u,v),max(u,v)) -> y-index / internal edge id
 	// params   : see Params
-	explicit TriangleBucketBatch(const std::vector<std::pair<VertexId,VertexId>>& neg_edges,
+	explicit TriangleBucketBatch(const std::vector<Edge>& neg_edges,
 	                                   const PosAdj& pos_adj,
 	                                   const EdgeIndex& edge_index,
 	                                   TriangleBucketBatch::Params params)
@@ -101,7 +102,7 @@ public:
 	    
 	
 	// Convenience overload: uses default Params{} (avoids default-arg inside class)
-	explicit TriangleBucketBatch(const std::vector<std::pair<VertexId,VertexId>>& neg_edges,
+	explicit TriangleBucketBatch(const std::vector<Edge>& neg_edges,
 	                                   const PosAdj& pos_adj,
 	                                   const EdgeIndex& edge_index)
 	    : TriangleBucketBatch(neg_edges, pos_adj, edge_index, Params{}) {}
@@ -151,7 +152,7 @@ private:
     bool already_taken_(const Candidate& c) const;
     void commit_(const Candidate& c, std::vector<int>& used);
 
-    const std::vector<std::pair<VertexId,VertexId>>& neg_edges_;
+    const std::vector<Edge>& neg_edges_;
     const PosAdj& pos_adj_;
     const EdgeIndex& edge_index_;
     Params P_;
