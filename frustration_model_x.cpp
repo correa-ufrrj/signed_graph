@@ -15,8 +15,8 @@ void FrustrationModelX::build() {
         x[i] = IloBoolVar(env, ("x_" + std::to_string(i)).c_str());
     z = IloNumVar(env, "z");
 
-    const auto& d_plus = graph.get_plus_degrees();
-    const auto& d_minus = graph.get_minus_degrees();
+    const auto& d_plus = graph.get_pos_degrees();
+    const auto& d_minus = graph.get_neg_degrees();
 
     IloExpr obj_expr(env);
     obj_expr += z;
@@ -216,7 +216,7 @@ FrustrationModelX::generate_edge_partition_ineq(const IloNumArray& x_vals) {
     std::vector<std::pair<int, int>> ordered_pairs;
     std::vector<std::pair<int, int>> undecided_pairs;
 
-    for (const auto& [edge, sign] : signs) {
+    for (const auto& [edge, sign, _] : signs) {
         int u = edge.first;
         int v = edge.second;
         double xu = x_vals[u];

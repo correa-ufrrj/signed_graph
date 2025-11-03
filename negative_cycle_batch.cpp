@@ -91,58 +91,15 @@ void NegativeCycleBatch::build_initial_state_() {
     pos_deg_.assign((size_t)vcount_, 0);
 
     const auto& signs_view = G_.signs_view();
-    const auto& w          = G_.get_weights();
-
-    if (w.empty()) {
-        std::cout << "[INIT-NegativeCycleBatch] weights are empty\n";
-    } else {
-        // min / max
-        const auto [it_min, it_max] = std::minmax_element(w.begin(), w.end());
-        const double w_min   = *it_min;
-        const double w_max   = *it_max;
-
-        // mean
-        const double w_mean  = std::accumulate(w.begin(), w.end(), 0.0) / static_cast<double>(w.size());
-
-        // median
-        double w_median = 0.0;
-        {
-            std::vector<double> tmp(w.begin(), w.end());
-            auto mid = tmp.begin() + tmp.size() / 2;
-            std::nth_element(tmp.begin(), mid, tmp.end());
-            if (tmp.size() % 2 == 1) {
-                w_median = *mid;
-            } else {
-                auto mid2 = tmp.begin() + (tmp.size() / 2 - 1);
-                std::nth_element(tmp.begin(), mid2, tmp.end());
-                w_median = (*mid + *mid2) / 2.0;
-            }
-        }
-
-        std::cout << "[INIT-NegativeCycleBatch] w-max=" << w_max
-                  << ", w-min=" << w_min
-                  << ", w-mean=" << w_mean
-                  << ", w-median=" << w_median
-                  << std::endl;
-    }
+    // NOTE: raw weights removed in new API; positivity decided via G_.is_pos_edge(eid)
 
     std::vector<double> pos_bases; pos_bases.reserve((size_t)ecount_);
     for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
+        if (!G_.is_pos_edge(eid)) continue; // positivity via SignedGraph semantics
         const auto se = signs_view[eid];
-        const double we = w[eid];
-        if (we > 0.0) {
-
-            base_pos_[(size_t)eid] = std::max(1e-12, std::fabs(we));
-            pos_bases.push_back(base_pos_[(size_t)eid]);
-            ++pos_deg_[(size_t)se.points.first];
-            ++pos_deg_[(size_t)se.points.second];
-        } else if (we == 0.0) {
-            base_pos_[(size_t)eid] = 1e-12;
-            pos_bases.push_back(1e-12);
-            ++pos_deg_[(size_t)se.points.first];
-            ++pos_deg_[(size_t)se.points.second];
-        }
-        // NOTE: w < 0.0 handled by caller via neg_edges_ (we do NOT push here).
+        ++pos_deg_[(size_t)se.points.first];
+        ++pos_deg_[(size_t)se.points.second];
+        pos_bases.push_back(1.0); // unit persistent base at init
     }
 
     if (!pos_bases.empty()) {

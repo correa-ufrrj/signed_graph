@@ -35,7 +35,7 @@ FrustrationModel::FrustrationModel(SignedGraphForMIP& g, int cut_flags)
     , signs(g.signs_view()) {
 
     m_minus = 0;
-    for (const auto& [_, sign] : signs) if (sign < 0) m_minus++;
+    for (const auto& [_, sign, __] : signs) if (sign < 0) m_minus++;
     const int m = graph.edge_count();
     signs0.resize(m);
     for (const auto& [e, idx] : edge_index) {
@@ -86,24 +86,24 @@ std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_triangl
     return triangle_cuts;
 }
 
-std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_negative_cycle_cuts(IloEnv& env) {
-    std::vector<std::pair<IloRange, std::string>> all_cuts;
-    auto cycles = graph.find_switched_lower_bound();
-
-    for (const auto& cycle : cycles) {
-        // If triangle cuts are enabled, skip 2-pos cycles here to avoid duplicates.
-        if (use_cut_generator & TRIANGLE_CUTS)
-            if (cycle.pos_edges().size() == 2) continue;
-
-        std::vector<Edge> all_edges = { cycle.neg_edge() };
-        const auto& pos = cycle.pos_edges();
-        all_edges.insert(all_edges.end(), pos.begin(), pos.end());
-
-        auto cuts = generate_cycle_cuts(env, all_edges);
-        all_cuts.insert(all_cuts.end(), cuts.begin(), cuts.end());
-    }
-    return all_cuts;
-}
+//std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_negative_cycle_cuts(IloEnv& env) {
+//    std::vector<std::pair<IloRange, std::string>> all_cuts;
+//    auto cycles = graph.find_switched_lower_bound();
+//
+//    for (const auto& cycle : cycles) {
+//        // If triangle cuts are enabled, skip 2-pos cycles here to avoid duplicates.
+//        if (use_cut_generator & TRIANGLE_CUTS)
+//            if (cycle.pos_edges().size() == 2) continue;
+//
+//        std::vector<Edge> all_edges = { cycle.neg_edge() };
+//        const auto& pos = cycle.pos_edges();
+//        all_edges.insert(all_edges.end(), pos.begin(), pos.end());
+//
+//        auto cuts = generate_cycle_cuts(env, all_edges);
+//        all_cuts.insert(all_cuts.end(), cuts.begin(), cuts.end());
+//    }
+//    return all_cuts;
+//}
 
 double FrustrationModel::frustration_index(double obj_val) const {
     return (obj_val + m_minus) / graph.edge_count();
@@ -184,7 +184,7 @@ void FrustrationModel::export_solution(const std::string& file_prefix, bool with
 
 	auto Gp = graph.compose_switching(partition);
     int frustrated = Gp.frustrated_edges();
-    auto neg_degrees = Gp.get_minus_degrees();
+    auto neg_degrees = Gp.get_neg_degrees();
     int num_neg_edges = std::accumulate(neg_degrees.begin(), neg_degrees.end(), 0) / 2;
     double runtime = std::chrono::duration<double>(end_time - start_time).count();
 

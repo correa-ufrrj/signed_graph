@@ -4,6 +4,7 @@
 #include <vector>
 #include <unordered_map>
 #include <iostream>
+#include <utility>
 
 struct Edge {
     int first, second;
@@ -60,5 +61,11 @@ private:
     std::vector<Edge> pos_edges_;
 };
 
-std::ostream& operator<<(std::ostream& os, const NegativeCycle& nc);
+// Inline definitions to satisfy linker
+inline NegativeCycle::NegativeCycle(const Edge& neg_edge, std::vector<Edge>&& pos_edges)
+    : neg_edge_(neg_edge), pos_edges_(std::move(pos_edges)) {}
 
+inline const Edge& NegativeCycle::neg_edge() const { return neg_edge_; }
+inline const std::vector<Edge>& NegativeCycle::pos_edges() const { return pos_edges_; }
+
+std::ostream& operator<<(std::ostream& os, const NegativeCycle& nc);

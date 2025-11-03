@@ -1,4 +1,3 @@
-
 // negative_cycle_batch.h
 #pragma once
 

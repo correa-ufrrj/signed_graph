@@ -56,8 +56,8 @@ void FrustrationModelXY::build() {
     const int n = graph.vertex_count();
     const int m = graph.edge_count();
 
-    const auto& d_plus  = graph.get_plus_degrees();
-    const auto& d_minus = graph.get_minus_degrees();
+    const auto& d_plus  = graph.get_pos_degrees();
+    const auto& d_minus = graph.get_neg_degrees();
 
     // ================== Vars ==================
     for (int i = 0; i < n; ++i)
@@ -73,7 +73,7 @@ void FrustrationModelXY::build() {
     {
         IloExpr obj(env);
         for (int i = 0; i < n; ++i) obj += (d_plus[i] - d_minus[i]) * x[i];
-        for (const auto& [e, sgn] : signs) obj += -2.0 * sgn * y[edge_index[e]];
+        for (const auto& [e, sgn, _] : signs) obj += -2.0 * sgn * y[edge_index[e]];
         objective = IloMinimize(env, obj);
         model.add(objective);
         obj.end();
@@ -82,7 +82,7 @@ void FrustrationModelXY::build() {
     // ============ Base formulation (edge constraints) ============
     {
         IloRangeArray base(env);
-        for (const auto& [e, sgn] : signs) {
+        for (const auto& [e, sgn, _] : signs) {
             const int u = e.first, v = e.second;
             const int idx = edge_index[e];
             if (sgn > 0) {
@@ -113,7 +113,7 @@ void FrustrationModelXY::build() {
 	            E += (double)dsig * x[u];
 	
 	            // Sum over edges incident to u, using σ(u,v) ∈ {+1,-1}
-	            for (const auto& [e, sgn] : signs) {
+	            for (const auto& [e, sgn, _] : signs) {
 	                if (e.first == u || e.second == u) {
 	                    const int v   = (e.first == u) ? e.second : e.first;
 	                    const int idx = edge_index[e];
@@ -269,7 +269,7 @@ void FrustrationModelXY::build() {
 
     // ========= Symmetry break (no leaks) ========
     {
-		const int vstar = (int)graph.max_plus_degree_vertex();
+		const int vstar = (int)graph.max_pos_degree_vertex();
 		const double xfix = (sg_sw.get_x(vstar) >= 0.5 ? 1.0 : 0.0);
 		model.add(x[vstar] == xfix);
 
@@ -427,8 +427,8 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
         owner.snapshot_lp_solution(acc);
         owner.graph.reseed_switching(owner.xhat);
 
-		const SignedGraph::GreedyKickOptions UB_OPTS = [&]{
-		    SignedGraph::GreedyKickOptions o;
+		const SignedGraphForMIP::GreedyKickOptions UB_OPTS = [&]{
+		    SignedGraphForMIP::GreedyKickOptions o;
 		    o.neg_edge_threshold_abs        = -1;
 		    o.neg_edge_threshold_frac       = 0.03;
 		    o.max_kicks                     = 3;
@@ -441,8 +441,6 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 		    o.delta_m_minus_cap             = 512;
 		    o.delta_m_minus_penalty         = 0.0;
 		    o.R_max                         = 10;
-		    o.K_max                         = 5;
-		    o.L_max                         = 3;
 		    o.Delta                         = 1;
 		    return o;
 		}();
@@ -595,7 +593,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
     const int max_kicks = (is_root && zero_ratio >= 0.30) ? 3 : 1;
 
     // 4) UB options
-    SignedGraph::GreedyKickOptions UB_OPTS;
+    SignedGraphForMIP::GreedyKickOptions UB_OPTS;
     UB_OPTS.neg_edge_threshold_abs  = -1;
     UB_OPTS.neg_edge_threshold_frac = 0.03;
     UB_OPTS.max_kicks               = max_kicks;
@@ -607,10 +605,13 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
     UB_OPTS.relax_to_all_pos_if_Z0_empty = true;
     UB_OPTS.delta_m_minus_cap       = 512;
     UB_OPTS.delta_m_minus_penalty   = 0.0;
-    UB_OPTS.R_max = 10; UB_OPTS.K_max = 1; UB_OPTS.L_max = 2; UB_OPTS.Delta = 0;
+    UB_OPTS.R_max = 10; UB_OPTS.Delta = 0;
 
     // 5) run greedy switching
-    SignedGraphForMIP sg = owner.graph.greedy_switching(UB_OPTS).integer_projection();
+    SignedGraphForMIP sg = owner.graph.greedy_switching(UB_OPTS);
+    sg.apply_integer_projection();
+    UB_OPTS.R_max = 0;
+    sg.apply_greedy_switching(UB_OPTS);
    	sg.align_switching(owner.sym_vstar, owner.sym_xfix);
 
     IloNumVarArray xy_vars(getEnv());
@@ -618,13 +619,19 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 
 	for (int u = 0; u < n; ++u) {
 	    // s[u] is ±1 here; turn into {0,1}
-	    const double xu = sg.get_x(u);
+	    const double xu = sg.get_rounded_x(u);
 	    xy_vars.add(owner.x[u]); xy_vals.add(xu);
 	}
 	for (const auto& [e, idx] : owner.edge_index) {
-	    const double yprod = sg.get_y(e);
+	    const double yprod = sg.get_rounded_y(e);
         xy_vars.add(owner.y[idx]); xy_vals.add(yprod);
 	}
+
+	const auto neg = sg.negative_edge_count();
+	const auto projNeg = sg.integer_projection().negative_edge_count();
+	std::cout << "[HEURISTIC-SOL] num neg edges=" << neg
+	          << " projNeg=" << projNeg
+	          << " (should correlate with frustration)" << std::endl;
 	
 	auto eval_objective_for_assignment = [&](
 	    const IloNumVarArray& vars,
@@ -652,15 +659,25 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 	    return z;  // same numeric value as CPLEX reports (no sense flip needed)
 	};
 	
+	// Build once (reuse across checks if you like)
+	auto build_val_map = [&](const IloNumVarArray& vars, const IloNumArray& vals){
+	    std::unordered_map<IloInt, double> val_by_id;
+	    val_by_id.reserve(static_cast<size_t>(vars.getSize()));
+	    for (IloInt i = 0; i < vars.getSize(); ++i)
+	        val_by_id.emplace(vars[i].getId(), static_cast<double>(vals[i]));
+	    return val_by_id;
+	};
+	
 	auto max_violations = [&](const IloNumVarArray& vars, const IloNumArray& vals){
-	    auto val = [&](IloNumVar v){
-	        for (IloInt i=0;i<vars.getSize();++i) if (vars[i].getId()==v.getId()) return (double)vals[i];
-	        return 0.0;
+	    const auto val_by_id = build_val_map(vars, vals);
+	    auto val = [&](IloNumVar v) -> double {
+	        auto it = val_by_id.find(v.getId());
+	        return (it == val_by_id.end()) ? 0.0 : it->second;
 	    };
-	    double base_max = 0.0, netdeg_max = 0.0;
+	    double base_max = 0.0, netdeg_max = 0.0, netdeg_maxx = 0.0;
 	
 	    // Base constraints
-	    for (const auto& [e, sgn] : owner.signs) {
+	    for (const auto& [e, sgn, _] : owner.signs) {
 	        int u=e.first, v=e.second, idx=owner.edge_index[e];
 	        double xu = val(owner.x[u]), xv = val(owner.x[v]), yuv = val(owner.y[idx]);
 	
@@ -674,24 +691,25 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 	
 	    // Net-degree cuts (same formula you used in build)
 	    for (int u=0; u<owner.graph.vertex_count(); ++u) {
-	        const int dsig = (int)(owner.graph.get_plus_degrees()[u] - owner.graph.get_minus_degrees()[u]);
+	        const int dsig = owner.graph.net_degree(u);
+	        if (dsig < 0) netdeg_max++;
 	        const int rhs  = (int)std::floor(0.5 * (double)dsig);
 	
 	        double E = (double)dsig * val(owner.x[u]);
-	        for (const auto& [e, sgn] : owner.signs) {
+	        for (const auto& [e, sgn, _] : owner.signs) {
 	            if (e.first==u || e.second==u) {
 	                int v = (e.first==u)? e.second : e.first;
 	                int idx = owner.edge_index[e];
 	                E -= (2.0 * val(owner.y[idx]) - val(owner.x[v])) * (double)sgn;
 	            }
 	        }
-	        netdeg_max = std::max(netdeg_max, E - (double)rhs);
+	        netdeg_maxx = std::max(netdeg_maxx, E - (double)rhs);
 	    }
 	
 	    std::cout << "[CHECK] base_max_violation=" << base_max
+	              << " netdeg_maxx_violation=" << netdeg_maxx
 	              << " netdeg_max_violation=" << netdeg_max << "\n";
 	};
-
 
     // 7) post solution if improved
     const auto obj_val = eval_objective_for_assignment(xy_vars, xy_vals);
@@ -701,7 +719,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 			  << " obj_val=" << obj_val
 			  << " incumbent=" << incumbent
 			  << "\n";
-//	max_violations(xy_vars, xy_vals);
+	max_violations(xy_vars, xy_vals);
     if (obj_val < incumbent) {
         setSolution(xy_vars, xy_vals, obj_val);
         owner.f_index = obj_val / owner.graph.edge_count();
