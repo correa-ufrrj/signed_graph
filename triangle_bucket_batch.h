@@ -83,7 +83,7 @@ public:
     struct Params {
         int K_tri_per_neg = 8;      // prefilter top-K per bucket (not an acceptance quota)
         int B_tri         = 64;     // global per-batch budget
-        int cap_per_vertex= 3;      // per-vertex cap across the batch (small integer)
+        int cap_per_vertex= 1;      // per-vertex cap across the batch (small integer)
     };
 
 	// neg_edges: list of (u,v) that are negative under current switching

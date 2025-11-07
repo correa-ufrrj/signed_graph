@@ -224,6 +224,34 @@ void NegativeCycleBatch::on_accept_(int full_eid, double /*density*/) {
     bump_cross_batch_(full_eid, /*|C|=*/3);
 }
 
+// Inside NegativeCycleBatch (private section)
+double NegativeCycleBatch::best_twohop_upper_bound_(int u, int v) const {
+    double ub = std::numeric_limits<double>::infinity();
+
+    // 1-hop (direct)
+    igraph_integer_t e_uv;
+    if (igraph_get_eid(&g_pos_, &e_uv, u, v, 0, 0) == IGRAPH_SUCCESS) {
+        ub = std::min(ub, std::max(1e-12, (double) VECTOR(saved_weights_pos_)[e_uv]));
+    }
+
+    // 2-hop via triangles u-w-v
+    igraph_vector_int_t Nu; igraph_vector_int_init(&Nu, 0);
+    igraph_neighbors(&g_pos_, &Nu, u, IGRAPH_ALL);
+    const igraph_integer_t nu = igraph_vector_int_size(&Nu);
+    for (igraph_integer_t i = 0; i < nu; ++i) {
+        const int w = VECTOR(Nu)[i];
+        igraph_integer_t e_uw, e_wv;
+        if (igraph_get_eid(&g_pos_, &e_uw, u, w, 0, 0) != IGRAPH_SUCCESS) continue;
+        if (igraph_get_eid(&g_pos_, &e_wv, w, v, 0, 0) != IGRAPH_SUCCESS) continue;
+        const double c =
+            std::max(1e-12, (double) VECTOR(saved_weights_pos_)[e_uw]) +
+            std::max(1e-12, (double) VECTOR(saved_weights_pos_)[e_wv]);
+        if (c < ub) ub = c;
+    }
+    igraph_vector_int_destroy(&Nu);
+    return ub;
+}
+
 bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
     const auto edge_idx = G_.edge_index();
     out.clear();
@@ -289,14 +317,36 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	    };
 	
 	    // --- Build buckets -------------------------------------------------
+        // Silence igraph "Couldn't reach some vertices" warnings just for this batch.
+        struct IgraphWarningSilencer {
+            igraph_warning_handler_t* prev = nullptr;
+            static void noop(const char*, const char*, int) {}
+            IgraphWarningSilencer() : prev(igraph_set_warning_handler(noop)) {}
+            ~IgraphWarningSilencer() { igraph_set_warning_handler(prev); }
+        } _silence_igraph_warnings_guard;
 	    for (const auto& e_neg : neg_edges_uncov) {
 	        const int uu = e_neg.first, vv = e_neg.second;
 	        const int neg_full_eid = (int)edge_idx[Edge{uu, vv}];
 	        double best_len = std::numeric_limits<double>::infinity();
-	
+
+            // Reserve bucket capacity up-front for this negative edge
+            auto& buck_res = buckets[neg_full_eid];
+            buck_res.reserve(std::max(1, P_.K_sp_per_neg));
+
+			// Reuse a single igraph_vector_int_t across K repeats to avoid init/destroy churn
+            igraph_vector_int_t path; igraph_vector_int_init(&path, 0);
 	        // deterministic repeat up to K_sp_per_neg
 	        for (int rep = 0; rep < std::max(1, P_.K_sp_per_neg); ++rep) {
-	            igraph_vector_int_t path; igraph_vector_int_init(&path, 0);
+				// Pre-Dijkstra prune for repeats using 1–2 hop upper bound on current ω′
+				if (rep > 0 && std::isfinite(best_len)) {
+				    const double ub2 = best_twohop_upper_bound_(uu, vv);
+				    // If even the fastest 1–2 hop route cannot beat incumbent best_len, skip this repeat
+				    if (!(ub2 + 1e-12 < best_len)) {
+				        continue;
+				    }
+				}
+				
+				igraph_vector_int_clear(&path);
 	            const auto t_dij0 = clock::now();
 	            igraph_get_shortest_path_dijkstra(&g_pos_, &path, nullptr, uu, vv, &saved_weights_pos_, IGRAPH_ALL);
 	            ms_dijkstra += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_dij0).count();
@@ -304,7 +354,6 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	
 	            const int nodes_on_path = igraph_vector_int_size(&path);
 	            if (nodes_on_path < 2) {
-	                igraph_vector_int_destroy(&path);
 	                new_disconnected.push_back(e_neg);
 	                break;
 	            }
@@ -326,10 +375,12 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	                }
 	            }
 	
+	            path_nodes_scanned += nodes_on_path;
+				pos_edges_on_paths += (int)pos_peids.size();
 	            const double len_now = path_cost(pos_peids);
 	
 	            // only keep strictly improving bumped length for this anchor
-	            if (len_now + 1e-12 < best_len) {
+	            if (len_now + 1e-12 < 1.0 * best_len) {
 	                best_len = len_now;
 	
 	                SPCand c;
@@ -342,7 +393,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	                c.score1    = score_primary(c.pos_peids); // φ, viol unavailable here
 	                c.score2    = 0.0;
 	
-	                buckets[neg_full_eid].push_back(std::move(c));
+	                buck_res.push_back(std::move(c));
 	
 	                // within-batch density + emit bump ∝ 1/|C|
 	                const double dens = 1.0 / std::max(1, nodes_on_path);
@@ -357,17 +408,16 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	                    VECTOR(saved_weights_pos_)[peid] = std::max(1e-12, VECTOR(saved_weights_pos_)[peid] + 2.0 * alt_path_bump_);
 	                }
 	            }
-	            igraph_vector_int_destroy(&path);
 	        }
+            igraph_vector_int_destroy(&path);
 	
 	        // sort & truncate bucket
-	        auto& buck = buckets[neg_full_eid];
-	        std::sort(buck.begin(), buck.end(), [](const SPCand& A, const SPCand& B){
+	        std::sort(buck_res.begin(), buck_res.end(), [](const SPCand& A, const SPCand& B){
 	            if (A.score1 != B.score1) return A.score1 > B.score1; // higher better
 	            if (A.score2 != B.score2) return A.score2 > B.score2; // higher better
 	            return A.cost < B.cost; // shorter tie-break
 	        });
-	        if ((int)buck.size() > std::max(1, P_.K_sp_per_neg)) buck.resize(std::max(1, P_.K_sp_per_neg));
+	        if ((int)buck_res.size() > std::max(1, P_.K_sp_per_neg)) buck_res.resize(std::max(1, P_.K_sp_per_neg));
 	    }
 	
 	    // --- Two-pass selection -------------------------------------------
@@ -432,24 +482,30 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	    }
 	
 	    // Pass 2: fill under budget across remaining candidates
-	    if (accepted_sp < sp_budget) {
-	        // Build a flat list of remaining candidates, ordered by score
-	        std::vector<std::pair<int, const SPCand*>> rem; rem.reserve(buckets.size()*2);
+	   if (accepted_sp < sp_budget) {
+	        struct Item { int neg_full_eid; const SPCand* c; };
+	        auto cmp = [](const Item& A, const Item& B){
+	            if (A.c->score1 != B.c->score1) return A.c->score1 < B.c->score1; // max-heap by score1
+	            if (A.c->score2 != B.c->score2) return A.c->score2 < B.c->score2; // then by score2
+	            if (A.c->cost   != B.c->cost  ) return A.c->cost   > B.c->cost;   // shorter first
+	            return A.c < B.c; // deterministic tie-break
+	        };
+	
+	        std::vector<Item> heap; heap.reserve(buckets.size()*2);
 	        for (auto& kv : buckets) {
 	            const int neg_full_eid = kv.first;
 	            auto& buck = kv.second;
-	            // skip the first candidate (potentially used in pass 1); add the rest
-	            for (size_t i = 0; i < buck.size(); ++i) rem.emplace_back(neg_full_eid, &buck[i]);
+	            // Skip the first candidate (potentially used in Pass 1); add the rest
+	            for (size_t i = 1; i < buck.size(); ++i) {
+	                heap.push_back(Item{neg_full_eid, &buck[i]});
+	            }
 	        }
-	        std::sort(rem.begin(), rem.end(), [](auto& A, auto& B){
-	            if (A.second->score1 != B.second->score1) return A.second->score1 > B.second->score1;
-	            if (A.second->score2 != B.second->score2) return A.second->score2 > B.second->score2;
-	            return A.second->cost < B.second->cost;
-	        });
 	
-	        for (auto& pr : rem) {
-	            if (accepted_sp >= sp_budget) break;
-	            if (try_accept(pr.first, *pr.second)) ++accepted_sp;
+	        std::make_heap(heap.begin(), heap.end(), cmp);
+	        while (accepted_sp < sp_budget && !heap.empty()) {
+	            std::pop_heap(heap.begin(), heap.end(), cmp);
+	            Item it = heap.back(); heap.pop_back();
+	            if (try_accept(it.neg_full_eid, *it.c)) ++accepted_sp;
 	        }
 	    }
 	
@@ -469,7 +525,8 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
         finished_ = true;
     }
 
-    std::cout << "[TRI-PROFILE] negE_scanned=" << neg_edges_scanned
+    std::cout << "[TRI_CYC-PROFILE] negE_scanned=" << neg_edges_scanned
+    		  << ", K_sp_per_neg=" << P_.K_sp_per_neg
               << ", cycles_out=" << cycles_emitted_now
               << ", tri_out=" << triangles_emitted_now
               << ", sum_path_nodes=" << path_nodes_scanned

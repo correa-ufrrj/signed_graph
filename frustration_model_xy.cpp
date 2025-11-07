@@ -26,7 +26,6 @@ static IloRange make_cycle_cut_from_prelookups(
     const std::vector<Edge>& all_edges,
     const std::vector<int>& idx,
     const std::vector<int>& sgn,
-    const std::vector<int>* flip /*nullable*/,
     const IloNumVarArray& y,
     const IloNumVarArray& x)
 {
@@ -34,7 +33,7 @@ static IloRange make_cycle_cut_from_prelookups(
     int rhs = 0;
     for (size_t j = 0; j < all_edges.size(); ++j) {
         const Edge& e = all_edges[j];
-        int eff = sgn[j] * (flip ? (*flip)[j] : 1);
+        int eff = sgn[j];
         expr += (y[idx[j]] - 0.5 * x[e.first] - 0.5 * x[e.second]) * eff;
         if (eff < 0) ++rhs;
     }
@@ -216,16 +215,6 @@ void FrustrationModelXY::build() {
 	            }
 	        }
 	
-	        // Decide whether to add this cycle according to input flags
-	        const bool is_triangle = ((int)pos_full_eids.size() == 2);
-	        const bool want_tri    = (use_cut_generator & TRIANGLE_CUTS) != 0;
-	        const bool want_cyc    = (use_cut_generator & NEGATIVE_CYCLE_CUTS) != 0;
-	
-	        if ( (is_triangle && !want_tri) || (!is_triangle && !want_cyc) ) {
-	            ++seen; // counted for seed cap even if we didn't add a cut
-	            continue;
-	        }
-	
 	        // Build edge sequence [neg_edge, pos_path...] for the generic cycle cut generator
 	        std::vector<Edge> cycle_edges;
 	        cycle_edges.reserve(1 + pos_full_eids.size());
@@ -235,6 +224,7 @@ void FrustrationModelXY::build() {
 	        auto cuts = generate_cycle_cuts(env, cycle_edges); // generic (works for triangles and longer cycles)
 	        for (auto& kv : cuts) model.add(kv.first);
 	
+	        const bool is_triangle = ((int)cycle_edges.size() == 3);
 	        if (is_triangle) tri_seed_added += (int)cuts.size();
 	        else             cyc_seed_added += (int)cuts.size();
 	
@@ -302,7 +292,7 @@ void FrustrationModelXY::solve() {
               << "," << CFG.anneal_tri.B_min << "}" << "\n";
 
     // Register full pipeline separation callback
-    if (use_cut_generator & NEGATIVE_CYCLE_CUTS)
+    if (use_cut_generator & (NEGATIVE_CYCLE_CUTS | TRIANGLE_CUTS))
     	cplex.use(new (env) TriangleCycleCutGenerator(env, *this));
     // Keep heuristic
     cplex.use(new (env) SwitchingHeuristicCallback(env, *this));
@@ -325,93 +315,101 @@ FrustrationModelXY::build_cycle_cuts_from_keys(IloEnv& env,
                                                const std::vector<fmkey::CycleKey>& keys) const
 {
     std::vector<std::pair<IloRange, std::string>> out;
-    out.reserve(keys.size());
+    out.reserve(keys.size()); // lower bound; actual count may be larger
 
     for (const auto& k : keys) {
-        // Neg edge (a,b) + all positive edges from key
+        // Neg edge (a,b) + all positive edges from key (ordered edges form a cycle)
         std::vector<Edge> all_edges;
         all_edges.reserve(1 + k.pos.size());
 
         // neg (a,b)
         all_edges.emplace_back(k.neg.first, k.neg.second);
 
-        // positives, already canonicalized as (min,max)
+        // positives (expected to be in the cycle’s order)
         for (const auto& p : k.pos) all_edges.emplace_back(p.first, p.second);
 
-        // Build the *standard* inequality (no vertex-reversed variants here)
-        IloRange rng = generate_cycle_cut_standard(env, all_edges);
-        out.emplace_back(std::move(rng),
-                         (k.pos.size() == 2 ? "std-triangle" : "std-cycle"));
-//	    for (const auto& e : all_edges) {
-//	        if (signs[e].sign != signs0[edge_index[e]]) { out.emplace_back(std::move(generate_cycle_cut_reversed(env, all_edges)), (k.pos.size() == 2 ? "rev-triangle" : "rev-cycle")); break; }
-//	    }
+        // Generate ALL inequalities associated to this cycle
+        auto cuts = generate_cycle_cuts(env, all_edges);
+
+        // Append (move) into output
+        out.insert(out.end(),
+                   std::make_move_iterator(cuts.begin()),
+                   std::make_move_iterator(cuts.end()));
     }
+
     return out;
-}
-
-// helper remains as-is: make_cycle_cut_from_prelookups(...)
-
-IloRange FrustrationModelXY::generate_cycle_cut_standard(
-    IloEnv& env, const std::vector<Edge>& all_edges) const
-{
-    std::vector<int> idx, sgn;
-    idx.reserve(all_edges.size());
-    sgn.reserve(all_edges.size());
-    for (const auto& e : all_edges) {
-        const int eid = edge_index[e];        // ≡ full eid
-        idx.push_back(eid);
-        sgn.push_back(signs0[eid]);           // FROZEN sign
-    }
-    return make_cycle_cut_from_prelookups(env, all_edges, idx, sgn, nullptr, y, x);
-}
-
-IloRange FrustrationModelXY::generate_cycle_cut_reversed(
-    IloEnv& env, const std::vector<Edge>& all_edges) const
-{
-    std::vector<int> idx, sgn;
-    idx.reserve(all_edges.size());
-    sgn.reserve(all_edges.size());
-    for (const auto& e : all_edges) {
-        const int eid = edge_index[e];
-        idx.push_back(eid);
-        sgn.push_back(signs[e].sign);         // LIVE sign (post-switching)
-    }
-    return make_cycle_cut_from_prelookups(env, all_edges, idx, sgn, nullptr, y, x);
 }
 
 // Base virtual in FrustrationModel is pure, so provide a minimal override
 std::vector<std::pair<IloRange, std::string>>
-FrustrationModelXY::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges)
+FrustrationModelXY::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const
 {
-    std::vector<std::pair<IloRange, std::string>> cuts;
-    cuts.emplace_back(generate_cycle_cut_standard(env, all_edges), "standard");
-//    for (const auto& e : all_edges) {
-//        if (signs[e].sign != signs0[edge_index[e]]) { cuts.emplace_back(std::move(generate_cycle_cut_reversed(env, all_edges)), "reversed"); break; }
-//    }
-    return cuts;
-}
+    // --- Precompute edge ids and base (LIVE) signs in the order of all_edges
+    std::vector<int> idx;    idx.reserve(all_edges.size());
+    std::vector<int> sgn0;   sgn0.reserve(all_edges.size());
+    for (const auto& e : all_edges) {
+        const int eid = edge_index[e];      // full-edge id for e
+        idx.push_back(eid);
+        sgn0.push_back(signs0[eid]);      // LIVE sign (post-switching)
+    }
 
-std::vector<std::pair<IloRange, std::string>>
-FrustrationModelXY::generate_pending_triangle_cuts(IloEnv& env, const TriangleInequalities& t)
-{
-    auto build = [&](bool use_frozen) {
-        IloExpr expr(env);
-        int rhs = 0;
-        for (const auto& e : t.triangle) {
-            const int eid = edge_index[e];
-            const int sgn = use_frozen ? signs0[eid] : signs[e].sign;
-            expr += (y[eid] - 0.5 * x[e.first] - 0.5 * x[e.second]) * sgn;
-            if (sgn < 0) ++rhs;
+    // --- Collect unique vertices in deterministic order and build incidence map
+    std::vector<int> verts; verts.reserve(all_edges.size());
+    std::unordered_map<int, std::vector<int>> incident; // v -> edge indices in all_edges
+    incident.reserve(all_edges.size());
+
+    auto touch_vertex = [&](int v){
+        if (incident.find(v) == incident.end()) {
+            incident.emplace(v, std::vector<int>{});
+            verts.push_back(v);
         }
-        IloRange cut = (expr <= std::floor(rhs / 2.0));
-        expr.end();
-        return cut;
+    };
+    for (int i = 0; i < (int)all_edges.size(); ++i) {
+        const auto& e = all_edges[(size_t)i];
+        touch_vertex(e.first);
+        incident[e.first].reserve(2); incident[e.first].push_back(i);
+    }
+    for (int i = 0; i < (int)all_edges.size(); ++i) {
+        const auto& e = all_edges[(size_t)i];
+        incident[e.second].push_back(i);
+    }
+
+    const int n = (int)verts.size();
+    const int kmax = n / 2;
+
+    // Enumerate all subsets S with |S| ≤ floor(n/2) via DFS (sequential flips).
+    std::vector<std::pair<IloRange, std::string>> cuts;
+    cuts.reserve(1u << std::min(kmax, 12));  // heuristic pre-reserve
+
+    std::vector<int> sgn = sgn0; // mutable working signs
+    std::string cycle_type = (all_edges.size() == 3) ? "triangle" : "cycle";
+
+    std::function<void(int,int)> dfs = [&](int start, int chosen){
+        // Emit inequality for the current subset S (of size = chosen)
+        if (chosen <= kmax) {
+            cuts.emplace_back(make_cycle_cut_from_prelookups(env, all_edges, idx, sgn, y, x),
+            (chosen == 0) ? std::string("std-")+cycle_type : std::string("rev-")+cycle_type);
+        } else {
+            return; // guard (shouldn’t happen due to the for-loop pruning below)
+        }
+        // Try adding more vertices to S, respecting |S| ≤ kmax
+        for (int i = start; i < n; ++i) {
+            if (chosen + 1 > kmax) break;
+            const int v = verts[i];
+
+            // --- Flip signs for all edges incident to v (sequentially)
+            for (int ei : incident[v]) sgn[(size_t)ei] *= -1;
+
+            dfs(i + 1, chosen + 1);
+
+            // --- Undo flips (backtrack)
+            for (int ei : incident[v]) sgn[(size_t)ei] *= -1;
+        }
     };
 
-    std::vector<std::pair<IloRange, std::string>> out;
-    out.emplace_back(build(true ), "std-triangle"); // frozen signs
-    out.emplace_back(build(false), "rev-triangle"); // live (current switching)
-    return out;
+    dfs(0, 0);
+
+    return cuts;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -452,19 +450,14 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 
         // Knobs from SeparationConfig
         const double VIOL_TOL = owner.separation_config().ranking.viol_tol;
-        const auto&  rcfg     = owner.separation_config().reheat;   // SeparationConfig::ReheatPool
-        const double ema_alpha = rcfg.reheat_ema_alpha;
 
         int cuts_added = 0;
-        int reheat_added_now = 0;
-        int reheat_requeued  = 0;
-
-        // Stage up to reheat_stage_cap non-violated keys (we commit after the loop)
-        std::vector<std::pair<fmkey::CycleKey, ReheatItem>> staged;
-        staged.reserve(static_cast<size_t>(rcfg.reheat_stage_cap));
-
-        // Use the model-owned reheat pool (no globals)
-        auto& pool = owner.separation_state().P_reheat;
+        struct CutTypeTally {
+		  int std_triangle = 0;
+		  int std_cycle    = 0;
+		  int rev_triangle = 0;
+		  int rev_cycle    = 0;
+		} g_cut_tally;
 
         // Process each accepted key once
         for (const auto& key : R.accepted_keys) {
@@ -493,6 +486,10 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
                 if (violated) {
                     add(rng).setName(lbl);
                     ++cuts_added;
+					if      (kv.second == "std-triangle") ++g_cut_tally.std_triangle;
+					else if (kv.second == "std-cycle")    ++g_cut_tally.std_cycle;
+					else if (kv.second == "rev-triangle") ++g_cut_tally.rev_triangle;
+					else if (kv.second == "rev-cycle")    ++g_cut_tally.rev_cycle;
                     any_violated = true;
                     if (viol_amt > max_viol) max_viol = viol_amt;
                 }
@@ -500,63 +497,19 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
                 // Concert copies the range into the pool on add(); safe to end handle
                 rng.end();
             }
-
-            // If nothing was violated, stage this key for reheat (respect per-round cap)
-            if (!any_violated && static_cast<int>(staged.size()) < rcfg.reheat_stage_cap) {
-                ReheatItem item;
-                item.ttl       = rcfg.reheat_default_ttl;
-                item.ema_viol  = max_viol;   // 0 if no viol; we still seed EMA
-                item.last_viol = max_viol;
-                staged.emplace_back(key, std::move(item));
-            } else if (any_violated) {
-                // If this came from the pool, count as "added from reheat" and remove it
-                if (pool.contains(key)) ++reheat_added_now;
-                if (pool.contains(key)) {
-                    for (auto it = pool.begin(); it != pool.end(); ) {
-                        if (fmkey::CycleKeyEq{}(it->first, key)) it = pool.erase(it);
-                        else ++it;
-                    }
-                }
-            } else {
-                // was non-violated but staging cap already reached → requeue signal (best-effort)
-                if (pool.contains(key)) ++reheat_requeued;
-            }
-        }
-
-        // === Commit staged (non-violated) items to the pool, then enforce global cap ===
-        for (auto& kv : staged) {
-            const auto& key  = kv.first;
-            auto&       item = kv.second;
-
-            if (pool.contains(key)) {
-                // Refresh TTL and EMA for already-present key
-                pool.update_ema(key, item.last_viol, ema_alpha);
-                if (auto* p = pool.find_mutable(key)) p->ttl = rcfg.reheat_default_ttl;
-                ++reheat_requeued;
-            } else {
-                pool.upsert(key, item);
-                ++reheat_added_now;
-            }
-        }
-
-        // Hard clip to global cap (no TTL decrement here—keep decay in your scheduled stage)
-        if (pool.size() > rcfg.reheat_pool_cap) {
-            std::size_t overshoot = pool.size() - rcfg.reheat_pool_cap;
-            for (auto it = pool.begin(); it != pool.end() && overshoot > 0; ) {
-                it = pool.erase(it);
-                --overshoot;
-            }
         }
 
         // Telemetry
         std::cout << "[CALLBACK] tri_selected=" << R.triangles_accepted
                   << " sp_cycles="  << R.cycles_accepted
                   << " cuts_added="  << cuts_added
-                  << " reheat_staged=" << staged.size()
-                  << " reheat_added="  << reheat_added_now
-                  << " reheat_requeued=" << reheat_requeued
-                  << " pool_size_now=" << pool.size()
                   << "\n";
+		std::cout << "[CALLBACK] cuts_by_type"
+		          << " std-triangle=" << g_cut_tally.std_triangle
+		          << " std-cycle="    << g_cut_tally.std_cycle
+		          << " rev-triangle=" << g_cut_tally.rev_triangle
+		          << " rev-cycle="    << g_cut_tally.rev_cycle
+		          << "\n";
 
         // Budget summary
         const int base_B  = owner.separation_config().budget.B_tri;
@@ -674,10 +627,10 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 	        auto it = val_by_id.find(v.getId());
 	        return (it == val_by_id.end()) ? 0.0 : it->second;
 	    };
-	    double base_max = 0.0, netdeg_max = 0.0, netdeg_maxx = 0.0;
+	    double base_max = 0.0, netdeg_max = 0.0;
 	
 	    // Base constraints
-	    for (const auto& [e, sgn, _] : owner.signs) {
+	    for (const auto& [e, sgn, _] : sg.signs_view()) {
 	        int u=e.first, v=e.second, idx=owner.edge_index[e];
 	        double xu = val(owner.x[u]), xv = val(owner.x[v]), yuv = val(owner.y[idx]);
 	
@@ -690,24 +643,12 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 	    }
 	
 	    // Net-degree cuts (same formula you used in build)
-	    for (int u=0; u<owner.graph.vertex_count(); ++u) {
-	        const int dsig = owner.graph.net_degree(u);
+	    for (int u=0; u<sg.vertex_count(); ++u) {
+	        const int dsig = sg.net_degree(u);
 	        if (dsig < 0) netdeg_max++;
-	        const int rhs  = (int)std::floor(0.5 * (double)dsig);
-	
-	        double E = (double)dsig * val(owner.x[u]);
-	        for (const auto& [e, sgn, _] : owner.signs) {
-	            if (e.first==u || e.second==u) {
-	                int v = (e.first==u)? e.second : e.first;
-	                int idx = owner.edge_index[e];
-	                E -= (2.0 * val(owner.y[idx]) - val(owner.x[v])) * (double)sgn;
-	            }
-	        }
-	        netdeg_maxx = std::max(netdeg_maxx, E - (double)rhs);
 	    }
 	
 	    std::cout << "[CHECK] base_max_violation=" << base_max
-	              << " netdeg_maxx_violation=" << netdeg_maxx
 	              << " netdeg_max_violation=" << netdeg_max << "\n";
 	};
 
@@ -729,6 +670,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 }
 
 void FrustrationModelXY::configure_separation(const SeparationConfig& cfg) {
+	std::cout << "[CONFIGURE SEPARATION] use_triangles=" << cfg.modes.use_triangles << "\n";
     sep_cfg_ = cfg;
     driver_.reset();
 }
@@ -748,7 +690,6 @@ void FrustrationModelXY::ensure_driver_() {
         sep_state_.init_sizes_if_needed(graph);
         // Sync EMA knobs into persistent (mirrors SeparationConfig)
         sep_state_.ema_delta = sep_cfg_.ema.delta;
-        sep_state_.ema_rho   = sep_cfg_.ema.rho;
         sep_state_.ema_kappa = sep_cfg_.ema.kappa;
         driver_ = std::make_unique<TriangleCyclePipeline>(sep_state_, sep_cfg_);
     }
@@ -757,18 +698,15 @@ void FrustrationModelXY::ensure_driver_() {
 void FrustrationModelXY::reset_separation_state() {
     sep_state_.in_model_keys.clear();
     sep_state_.recent_keys.clear();
-    sep_state_.P_reheat.clear();
 
     sep_state_.init_sizes_if_needed(graph);
     std::fill(sep_state_.omega.begin(), sep_state_.omega.end(), 1.0);
-    std::fill(sep_state_.pool_count.begin(), sep_state_.pool_count.end(), 0.0);
     std::fill(sep_state_.H.begin(), sep_state_.H.end(), 0.0);
 }
 
 void FrustrationModelXY::print_separation_stats(std::ostream& os) const {
     os << "[SEP] omega.size=" << sep_state_.omega.size()
        << " H.size=" << sep_state_.H.size()
-       << " pool_count.size=" << sep_state_.pool_count.size()
        << " recent_keys=" << sep_state_.recent_keys.size()
        << " in_model_keys=" << sep_state_.in_model_keys.size()
        << std::endl;

@@ -122,12 +122,7 @@ void FrustrationModelX::build() {
     model.add(x[max_vertex] == s[max_vertex]);
 }
 
-std::vector<std::pair<IloRange, std::string>> FrustrationModelX::generate_pending_triangle_cuts(IloEnv& env, const TriangleInequalities& t) {
-    std::vector<std::pair<IloRange, std::string>> result;
-	return result;
-}
-
-std::vector<std::pair<IloRange, std::string>> FrustrationModelX::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) {
+std::vector<std::pair<IloRange, std::string>> FrustrationModelX::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const {
 //    std::set<int> vertices_set;
 //    for (const auto& edge : all_edges) {
 //        vertices_set.insert(edge.first);

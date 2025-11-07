@@ -19,6 +19,7 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
     if (buckets_.empty() || P_.B_tri <= 0) return selected_;
 
     std::vector<int> used_per_vertex(pos_adj_.size(), 0);
+	int cap_blocked = 0; // telemetry only
 
     // Round-robin over buckets in deterministic order
     std::vector<EdgeId> keys;
@@ -38,7 +39,7 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
     for (EdgeId key : keys) {
         auto& buck = buckets_[key];
         for (const auto& c : buck) {
-            if (!respect_cap_(c, used_per_vertex)) continue;
+            if (!respect_cap_(c, used_per_vertex)) { ++cap_blocked; continue; }
             commit_(c, used_per_vertex);
             ++budget_used;  // <-- count a committed triangle
             TBB_on_accept(c.neg_eid,    1.0/3.0);
@@ -65,7 +66,7 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
             auto& buck = buckets_[key];
             for (const auto& c : buck) {
                 if (already_taken_(c)) continue;
-                if (!respect_cap_(c, used_per_vertex)) continue;
+                if (!respect_cap_(c, used_per_vertex)) { ++cap_blocked; continue; }
                 commit_(c, used_per_vertex);
                 ++budget_used;  // <-- count a committed triangle
                 TBB_on_accept(c.neg_eid,    1.0/3.0);
@@ -84,6 +85,10 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
 
     stats_.B_eff    = budget_used;                 // <-- replace ‘effective_budget_used’
     stats_.selected = (int)selected_.size();
+    if (cap_blocked > 0) {
+        std::cout << "[TBB-CAP] blocked_by_cap=" << cap_blocked
+                  << " cap_per_vertex=" << P_.cap_per_vertex << "\n";
+    }
     return selected_;
 }
 
@@ -119,12 +124,8 @@ void TriangleBucketBatch::ensure_sorted_adjacency_() {
 
 bool TriangleBucketBatch::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
     if (P_.cap_per_vertex <= 0) return true;
-    if (c.u < 0 || c.v < 0 || c.w < 0) return false;
-    if (c.u >= (int)used.size() || c.v >= (int)used.size() || c.w >= (int)used.size()) return false;
-    if (used[c.u] >= P_.cap_per_vertex) return false;
-    if (used[c.v] >= P_.cap_per_vertex) return false;
-    if (used[c.w] >= P_.cap_per_vertex) return false;
-    return true;
+    if (c.w < 0 || c.w >= (int)used.size()) return false;
+    return used[c.w] < P_.cap_per_vertex;
 }
 
 bool TriangleBucketBatch::already_taken_(const Candidate& c) const {
@@ -135,9 +136,7 @@ bool TriangleBucketBatch::already_taken_(const Candidate& c) const {
 
 void TriangleBucketBatch::commit_(const Candidate& c, std::vector<int>& used) {
     selected_.push_back(c);
-    used[c.u] += 1;
-    used[c.v] += 1;
-    used[c.w] += 1;
+    ++used[c.w];
     taken_.insert(std::tuple<int,int,int>{c.u, c.w, c.v});
 }
 

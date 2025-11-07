@@ -20,7 +20,7 @@ inline std::pair<int,int> mm(int u, int v) {
 // A 1-negative-cycle key = (neg edge endpoints) + sorted list of distinct
 // positive edges (each canonicalized as (min,max)).
 struct CycleKey {
-    Edge neg = Edge(0,0);                                // neg edge endpoints (min,max)
+    Edge neg = Edge(0,0);              // neg edge endpoints (min,max)
     std::vector<Edge> pos;             // sorted, unique (min,max) positive edges
 };
 

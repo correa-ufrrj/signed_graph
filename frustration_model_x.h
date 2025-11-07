@@ -20,8 +20,7 @@ private:
 	inline std::vector<std::pair<int, int>> lift_edge_partition_cuts(const std::vector<std::pair<int, int>>& undecided, const IloNumArray& x_vals);
 	inline std::pair<std::vector<std::pair<int, int>>, std::vector<std::pair<int, int>>> generate_edge_partition_ineq(const IloNumArray& x_vals);
     inline std::vector<std::pair<IloRange, std::vector<std::pair<int, int>>>>  generate_cycle_ineq(const std::vector<Edge>& all_edges, const IloNumArray& x_vals);
-    std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) override;
-    std::vector<std::pair<IloRange, std::string>> generate_pending_triangle_cuts(IloEnv& env, const TriangleInequalities& t);
+    std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const override;
 
     class EdgePartitionCutGenerator : public IloCplex::UserCutCallbackI {
     public:

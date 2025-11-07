@@ -28,7 +28,7 @@ class NegativeCycleBatch {
 public:
     // Minimal, decoupled parameter pack for SP stage (mirrors TBB pattern)
     struct Params {
-        int    B_sp               = 64;   // per-batch SP budget
+        int    B_sp               = 0;   // per-batch SP budget
         int    K_sp_per_neg       = 3;    // alt paths per negative anchor
         int    sp_cap_per_vertex  = 8;    // per-vertex cap for accepted SP cycles
         int    tri_cap_per_vertex = 6;    // cap reused when NCB enforces per-vertex limits in triangle-first accept
@@ -45,6 +45,20 @@ public:
         // Min length for numerical stability
         double guide_len_eps = 1e-12;
     };
+
+// NegativeCycleBatch.h
+    template <class Sink>
+    void flush_emitted_to(Sink&& sink) {
+        // used_in_batch_pos_ is indexed by pos-edge id (peid) in g_pos_
+        const int Epos = (int)used_in_batch_pos_.size();
+        for (int peid = 0; peid < Epos; ++peid) {
+            double d = used_in_batch_pos_[peid];
+            if (d <= 0.0) continue;
+            const int full_eid = pos2full_eid_[peid];
+            sink(full_eid, d);
+            used_in_batch_pos_[peid] = 0.0; // clear for next batch
+        }
+    }
 
 	NegativeCycleBatch(const SignedGraphForMIP& G,
 	                   const std::vector<Edge>& neg_edges_uncov,
@@ -106,12 +120,6 @@ private:
     size_t              total_found_{0};
     int                 batches_emitted_{0};
 
-    // triangle-aware ordering (kept for compatibility; triangles now run via TBB)
-     // legacy no-op
-
-    // Cross-batch: bump base_pos_ when a cycle/triangle is accepted
-    
-
     // Positive-only graph + mappings
     igraph_t g_pos_{};
     bool g_pos_built_ = false;
@@ -140,6 +148,7 @@ private:
             base_pos_[(size_t)eid] += P_.cross_batch_penalty_scale + 1.0 / static_cast<double>(cycle_len);
         }
     }
+	double best_twohop_upper_bound_(int u, int v) const;
 
     void build_initial_state_();
     void build_mask_for_batch_();

@@ -76,10 +76,11 @@ void FrustrationModel::initialize_uncut_triangles() {
 
 std::vector<std::pair<IloRange, std::string>> FrustrationModel::generate_triangle_cuts(IloEnv& env) {
     std::vector<std::pair<IloRange, std::string>> triangle_cuts;
+    triangle_cuts.reserve(uncut_triangles.size() * 4); // 3-node cycle ⇒ up to 4 ineqs
     auto it = uncut_triangles.begin();
     while (it != uncut_triangles.end()) {
         auto& triangle = *it;
-        auto cuts = generate_pending_triangle_cuts(env, triangle);
+        auto cuts = generate_cycle_cuts(env, triangle.triangle);
         triangle_cuts.insert(triangle_cuts.end(), cuts.begin(), cuts.end());
         ++it;
     }

@@ -11,7 +11,6 @@
 #include <cmath>
 
 #include "signed_graph_mip.h"      // SignedGraphForMIP
-#include "reheat_pool.h"           // ReheatPool
 #include "cycle_key.h"             // fmkey::CycleKey
 #include "separation_config.h"     // SeparationConfig + adapters
 
@@ -32,15 +31,11 @@ int  TBB_budget_override(int base);
 struct SeparationPersistent {
     // Edge-aligned arrays over the FULL graph (size = |E|)
     std::vector<double> omega;         // persistent base weights ω ≥ eps (init 1.0)
-    std::vector<double> pool_count;    // density counts across ACCEPTED cuts
     std::vector<double> H;             // repulsion EMA ledger
 
     // Stateless de-dup (switching-agnostic keys)
     std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> in_model_keys;  // already added
     std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> recent_keys;    // seen recently
-
-    // Reheat storage (switching-agnostic)
-    ReheatPool P_reheat;
 
     // Annealing state (triangle budget across rounds)
     int    B_tri_cur        = 0;   // effective budget used by the next triangle stage
@@ -48,14 +43,12 @@ struct SeparationPersistent {
 
     // EMA parameters for H
     double ema_delta  = 0.85;   // decay (0<delta<1)
-    double ema_rho    = 0.02;   // reheated-accepted weight
     double ema_kappa  = 0.005;  // emitted-but-rejected weight
 
     // Convenience: initialize sizes once when graph is known
     void init_sizes_if_needed(const SignedGraphForMIP& G) {
         const int m = G.edge_count();
         if ((int)omega.size()      != m) omega.assign(m, 1.0);
-        if ((int)pool_count.size() != m) pool_count.assign(m, 0.0);
         if ((int)H.size()          != m) H.assign(m, 0.0);
     }
 };
@@ -81,6 +74,7 @@ struct SeparationRound {
     }
 };
 
+// full: original graph; pos: positive edges induced subgraph
 struct RoundGraphView {
     // maps
     std::vector<int> full2pos;    // |E| → {0..m_pos-1} or -1 if not in E⁺
@@ -167,7 +161,6 @@ private:
 
     // === Step-2+ stubs (no-ops in step 1) ===
     void build_omega_prime_pos_();
-    void pre_enumeration_reheat_();
     void triangle_stage_(const SignedGraphForMIP& G_);
     void sp_stage_(const SignedGraphForMIP& G_);
     void commit_stage_(const SignedGraphForMIP& G_);

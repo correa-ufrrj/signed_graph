@@ -161,10 +161,6 @@ uint64_t hash_sign_mask(const Mask& mask) {
 // SP stage: stash only the count here
 thread_local int g_sp_cycles_accepted = 0;
 
-// Reheat pool keys (non-violated cuts to retry on the next fractional round)
-thread_local ReheatPool g_reheat_pool;
-thread_local std::unordered_set<fmkey::CycleKey, fmkey::CycleKeyHash, fmkey::CycleKeyEq> g_reheat_inflight;
-
 extern "C" {
 // Called by TriangleBucketBatch/NCB during enumeration/selection
 void TBB_on_emit(int edge_id, double used_density) {
@@ -282,6 +278,12 @@ TriangleCyclePipeline::run_round(const SignedGraphForMIP& G_)
 	tri_selected_.clear();
 	covered_neg_eids_.clear();
 
+    // Read modes from config
+    const bool triangles_enabled = C_.modes.use_triangles;
+    const bool sp_enabled        = C_.modes.use_negcycles;
+    std::cout << "[PIPELINE] modes: triangles=" << (triangles_enabled?"on":"off")
+              << " negcycles=" << (sp_enabled?"on":"off") << "\n";
+
     const int m = G_.edge_count();
     round_.selected_count_full.assign(m, 0.0);
     g_sp_cycles_accepted = 0;
@@ -289,25 +291,6 @@ TriangleCyclePipeline::run_round(const SignedGraphForMIP& G_)
     // Clear per-round exported keys vector
     accepted_keys_.clear();
 	
-	// --- Reheat pre-stage: move pool keys to the head of this round ---
-	// Copy keys from the reheat pool so the callback evaluates them first at this LP.
-	std::size_t reheat_staged = 0;
-    g_reheat_inflight.clear();
-	if (!g_reheat_pool.empty()) {
-	    // Optionally: put a simple ordering (e.g., higher EMA first). For now, copy as-is.
-	    for (const auto& kv : g_reheat_pool) {
-	        accepted_keys_.push_back(kv.first);
-		    g_reheat_inflight.insert(kv.first);
-	        ++reheat_staged;
-	    }
-	    // Decrement TTL for all items we just selected; erase those that hit zero.
-	    auto [dec_cnt, erase_cnt] = g_reheat_pool.prune_by_ttl(); // TTL-- and erase zeros
-	    std::cout << "[REHEAT] staged=" << reheat_staged
-	              << " pool_after_stage=" << g_reheat_pool.size()
-	              << " ttl_dec=" << dec_cnt
-	              << " ttl_erased=" << erase_cnt << "\n";
-	}
-
     // === 1) Choose switching s and apply it ===
     // switching has been applied in the frustration model
 
@@ -381,12 +364,21 @@ TriangleCyclePipeline::run_round(const SignedGraphForMIP& G_)
     build_omega_prime_pos_();
 
     // === Run stages ===
-    pre_enumeration_reheat_();
-    triangle_stage_(G_);
-    sp_stage_(G_);
+    if (triangles_enabled && C_.budget.B_tri > 0) {
+        triangle_stage_(G_);
+    }
+    if (sp_enabled) {
+        sp_stage_(G_);
+    }
 
-    // === Commit persistent updates (ω/H/pool_count) ===
-    commit_stage_(G_);
+    // === Commit persistent updates (ω/H) ===
+    if ((triangles_enabled && C_.budget.B_tri > 0) || sp_enabled) {
+        { double sel_sum=0.0; int sel_nz=0; for (double v: round_.selected_count_full){ sel_sum+=v; if (v!=0.0) ++sel_nz; }
+          double used_sum=0.0; int used_nz=0; for (double v: round_.used_in_batch_pos){ used_sum+=v; if (v!=0.0) ++used_nz; }
+          std::cout << "[SP-PROBE] sel_nz="<<sel_nz<<" sel_sum="<<sel_sum
+                    << " used_nz_pos="<<used_nz<<" used_sum_pos="<<used_sum << "\n"; }
+    	commit_stage_(G_);
+    }
 
     Result R{};
     R.triangles_accepted = (int)tri_selected_.size();
@@ -475,7 +467,7 @@ void TriangleCyclePipeline::build_omega_prime_pos_()
 	auto [wp_min, wp_mean, wp_max] = min_mean_max(w_prime);
 	
 	std::cout << "[OMEGA'-STATS] ω base    min=" << wb_min << " mean=" << wb_mean << " max=" << wb_max << "\n";
-	std::cout << "[OMEGA'-STATS] H[log1p]*λ min=" << ht_min << " mean=" << ht_mean << " max=" << ht_max << "\n";
+	std::cout << "[OMEGA'-STATS] H[log1p]*λ_hist min=" << ht_min << " mean=" << ht_mean << " max=" << ht_max << "\n";
 	std::cout << "[OMEGA'-STATS] λ_LP·sal  min=" << lp_min << " mean=" << lp_mean << " max=" << lp_max << "\n";
 	std::cout << "[OMEGA'-STATS] ω'        min=" << wp_min << " mean=" << wp_mean << " max=" << wp_max << "\n";
 	
@@ -510,24 +502,13 @@ void TriangleCyclePipeline::build_omega_prime_pos_()
 	    if (std::isfinite(w_cap) && w > w_cap + 1e-12) ++above_cap;
 	}
 	const bool size_ok = ((int)round_.omega_prime_pos.size() == m_pos);
-	int map_anomalies = 0;
-	// verify every pos edge has a valid mapping
-	for (int pid = 0; pid < m_pos; ++pid) {
-	    int eid = Gt_.pos2full[pid];
-	    if (eid < 0 || eid >= (int)Gt_.full2pos.size() || Gt_.full2pos[eid] != pid) ++map_anomalies;
-	}
 	std::cout << "[OMEGA'-DOMAIN] size=" << round_.omega_prime_pos.size()
 	          << " m_pos=" << m_pos
 	          << " size_ok=" << (size_ok?1:0)
-	          << " map_anomalies=" << map_anomalies
 	          << " nan=" << nan_cnt
 	          << " inf=" << inf_cnt
 	          << " below_eps=" << below_eps
 	          << " above_cap=" << above_cap << "\n";
-}
-
-void TriangleCyclePipeline::pre_enumeration_reheat_() {
-// (Reserved for later steps.)
 }
 
 void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
@@ -569,9 +550,9 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
 	const int neg_raw = (int)neg_eids.size();
 	mean = (neg_raw ? mean / neg_raw : 0.0);
 	
-	// F: p60 gate + mean fallback
-	const double p60 = percentile_of(neg_sals, 0.60);
-	const double sal_min_fallback = std::max(p60, 0.5 * mean);
+	// F: p70 gate + mean fallback
+	const double p70 = percentile_of(neg_sals, 0.70);
+	const double sal_min_fallback = std::max(p70, 0.5 * mean);
 	
 	std::vector<Edge> neg_edges;                 // FIX: no pre-size
 	neg_edges.reserve(neg_eids.size() / 1.5);          // capacity only
@@ -586,7 +567,7 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
 	
 	std::cout << "[TBB-FILTER] negE_raw=" << neg_raw
 	          << " negE_keep=" << nsel
-	          << " sal_fallback=" << sal_min_fallback << " (p60=" << p60 << ", mean=" << mean << ")\n";
+	          << " sal_fallback=" << sal_min_fallback << " (p70=" << p70 << ", mean=" << mean << ")\n";
 
     // Params from config (respect defaults)
     TriangleBucketBatch::Params P = C_.to_tbb_params();
@@ -611,30 +592,22 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
 	    const int pid_wv = (c.pos_eid_wv >= 0 && c.pos_eid_wv < (int)Gt_.full2pos.size())
 	                       ? Gt_.full2pos[c.pos_eid_wv] : -1;
 	
-//	    const auto inv = [&](int pid)->double{
-//	        if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return 0.0;
-//	        return 1.0 / std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
-//	    };
-const double p = (C_.ranking.inv_power > 0 ? C_.ranking.inv_power : 2.0);
-const auto inv = [&](int pid)->double{
-    if (pid < 0 || pid >= (int)round_.omega_prime_pos.size()) return 0.0;
-    return std::pow( std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]), -p );
-};
-	
-	    // inverse harmonic mean (average of inverses)
-//	    double inv_sum = 0.0; int k = 0;
-//	    if (pid_uw >= 0) { inv_sum += inv(pid_uw); ++k; }
-//	    if (pid_wv >= 0) { inv_sum += inv(pid_wv); ++k; }
-//	    const double inv_hmean = (k > 0) ? (inv_sum / (double)k) : 0.0;
-
-	    const double inv_hmean = (pid_uw >= 0 && pid_wv >= 0) ? inv(sqrt(pid_uw*pid_wv)) : 0.0;
-	
-	    auto sal = [&](int eid){
-	        return (eid >= 0 && eid < (int)round_.sal_full.size()) ? round_.sal_full[eid] : 0.0;
-	    };
-	    c.phi = (sal(c.neg_eid) + sal(c.pos_eid_uw) + sal(c.pos_eid_wv)) / 3.0;
-	
-	    c.score_primary   = C_.ranking.alpha * inv_hmean + C_.ranking.theta * c.phi;
+		const double p = std::max(1.0, C_.ranking.inv_power);
+		auto w_at = [&](int pid) {
+		    return std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
+		};
+		
+		double inv_hmean = 0.0;
+		if (pid_uw >= 0 && pid_wv >= 0) {
+		    const double w1 = w_at(pid_uw), w2 = w_at(pid_wv);
+		    // If you want exactly α / Hmean(w): set C_.ranking.inv_power = 1.0
+		    if (p == 1.0) {
+		        inv_hmean = 0.5 * (1.0 / w1 + 1.0 / w2);   // = 1 / Hmean(w1,w2)
+		    } else {
+		        inv_hmean = 0.5 * (std::pow(w1, -p) + std::pow(w2, -p)); // stronger tilt to small ω′
+		    }
+		}
+		c.score_primary = C_.ranking.alpha * inv_hmean + C_.ranking.theta * c.phi;	    
 	    c.score_secondary = 0.0;
 	    c.viol = 0.0; // reserved for later violation-aware scoring
 	};
@@ -762,7 +735,7 @@ const auto inv = [&](int pid)->double{
 		b_next = std::max(soft_floor, b_next);
 		
 		// If we keep selecting nothing at/near the floor, turn it off
-		const int patience = 2; // rounds at/near floor with zero selections
+		const int patience = 1; // rounds at/near floor with zero selections
 		if (b_next <= soft_floor && zero_streak >= patience) {
 		    S_.B_tri_cur = 0; // hard-off
 		    std::cout << "[ANNEAL] hard-off: floor=" << soft_floor
@@ -814,8 +787,8 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
 	const int neg_raw = (int)neg_sals.size();
 	mean = (neg_raw ? mean / neg_raw : 0.0);
 	
-	const double p60 = percentile_of(neg_sals, 0.6);
-	const double sal_min_fallback = std::max(p60, 0.5 * mean);
+	const double p70 = percentile_of(neg_sals, 0.7);
+	const double sal_min_fallback = std::max(p70, 0.5 * mean);
 	
 	// Build uncovered list:
 	std::vector<Edge> neg_uncov; neg_uncov.reserve(neg_eids_all.size());
@@ -837,20 +810,58 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
 	          << " kept_for_sp=" << kept
 	          << " sal_min=" << sal_min_fallback
 	          << " keep_rate=" << std::fixed << std::setprecision(2) << (100.0 * (kept / denom))
-	          << "% (min=" << min << ", max=" << max << ", p60=" << p60 << ", mean=" << mean << ")\n";
+	          << "% (min=" << min << ", max=" << max << ", p70=" << p70 << ", mean=" << mean << ")\n";
+    if (kept == 0) { std::cout << "[SP-GATE] kept_for_sp=0 → skipping SP stage.\n"; return; }
 
     NegativeCycleBatch ncb(G_, neg_uncov, /*cover=*/false, C_.to_ncb_params());
 
     std::vector<NegativeCycle> batch;
     while (ncb.next(batch)) {
+        std::unordered_map<int,int> lnodes_hist;
+        int accepted_in_batch = 0;
+        const int emitted_batch = (int)batch.size();
         g_sp_cycles_accepted += (int)batch.size();
 
         accepted_keys_.reserve(accepted_keys_.size() + batch.size());
-        for (const auto& r : batch) {
-            fmkey::CycleKey k = fmkey::make_from_cycle(r);
+        // --- Accumulate commit signals for SP acceptances ---
+        for (const auto& cyc : batch) {
+            fmkey::CycleKey k = fmkey::make_from_cycle(cyc);
             if (S_.in_model_keys.find(k) != S_.in_model_keys.end()) continue;
             if (S_.recent_keys.find(k)   != S_.recent_keys.end())   continue;
             accepted_keys_.push_back(std::move(k));
+
+            // Density ~ 1/L where L = number of nodes on the pos path
+            const int L_nodes = (int)cyc.pos_edges().size() + 1;
+            ++lnodes_hist[L_nodes];
+            ++accepted_in_batch;
+            const double dens = 1.0 / std::max(1, L_nodes);
+
+            // Bump along positive path edges (FULL-ids) and mirror to POS-domain used mask
+            for (const auto& pe : cyc.pos_edges()) {
+                auto feid = edge_idx[pe];
+                round_.selected_count_full[(size_t)feid] += dens;
+            }
+
+            // Also give density credit to the negative anchor (u,v) reconstructed from path endpoints
+            auto neg_eid = edge_idx[cyc.neg_edge()];
+            round_.selected_count_full[(size_t)neg_eid] += dens;
+        }
+		// after finishing processing 'batch' (and before batch.clear())
+		ncb.flush_emitted_to([&](int full_eid, double d){
+		    const int pid = Gt_.full2pos[full_eid];
+		    if (pid >= 0 && pid < (int)round_.used_in_batch_pos.size()) {
+		        round_.used_in_batch_pos[(size_t)pid] += d;
+		    }
+		});
+        {
+            std::vector<std::pair<int,int>> hist_pairs;
+            hist_pairs.reserve(lnodes_hist.size());
+            for (auto &kv : lnodes_hist) hist_pairs.emplace_back(kv.first, kv.second);
+            std::sort(hist_pairs.begin(), hist_pairs.end(), [](const auto& a, const auto& b){ return a.first < b.first; });
+            std::ostringstream oss;
+            oss << "[SP-BATCH] accepted=" << accepted_in_batch << " emitted=" << emitted_batch << " L_nodes_hist=";
+            for (const auto& kv : hist_pairs) oss << " " << kv.first << ":" << kv.second;
+            std::cout << oss.str() << "\n";
         }
         batch.clear();
     }
@@ -868,7 +879,6 @@ void TriangleCyclePipeline::commit_stage_(const SignedGraphForMIP& G_) {
         round_.selected_count_full.assign(m, 0.0);
     if ((int)S_.omega.size() != m)      S_.omega.resize(m, 1.0);
     if ((int)S_.H.size() != m)          S_.H.resize(m, 0.0);
-    if ((int)S_.pool_count.size() != m) S_.pool_count.resize(m, 0.0);
 
     const double beta_sel = C_.weights.beta_sel;
     const double eps      = std::max(1e-12, C_.weights.omega_eps);
@@ -876,7 +886,6 @@ void TriangleCyclePipeline::commit_stage_(const SignedGraphForMIP& G_) {
                                                         : std::numeric_limits<double>::infinity());
 
     const double delta = S_.ema_delta;
-    const double rho   = S_.ema_rho;
     const double kappa = S_.ema_kappa;
 
     // (A) ω drift across rounds using accepted density
@@ -906,22 +915,19 @@ void TriangleCyclePipeline::commit_stage_(const SignedGraphForMIP& G_) {
     std::vector<double> Hnew = S_.H;
     for (double& v : Hnew) v *= delta;
 
-    // + ρ·accepted over ALL edges (neg & pos)
-    size_t H_acc_nz = 0;
-    for (int eid = 0; eid < m; ++eid) {
-        double acc = round_.selected_count_full[eid];
-        if (acc != 0.0) { Hnew[eid] += rho * acc; ++H_acc_nz; }
-    }
-
     // Compute (emitted − accepted) on POS edges via pos mapping
     size_t H_rej_nz = 0;
     double H_rej_sum = 0.0;
+	const double rho = C_.ema.rho; // new knob, try 0.05–0.1
     if (Gt_.m_pos > 0 && !round_.used_in_batch_pos.empty()) {
         // Map accepted FULL-edge densities to POS indices
         std::vector<double> acc_pos(Gt_.m_pos, 0.0);
         for (int pid = 0; pid < Gt_.m_pos; ++pid) {
             int eid = Gt_.pos2full[pid];
-            if (eid >= 0 && eid < m) acc_pos[pid] = round_.selected_count_full[eid];
+            if (eid >= 0 && eid < m) {
+				acc_pos[pid] = round_.selected_count_full[eid];
+				Hnew[eid] += rho * round_.selected_count_full[eid];
+			}
         }
         for (int pid = 0; pid < Gt_.m_pos; ++pid) {
             const double emitted  = (pid < (int)round_.used_in_batch_pos.size()) ? round_.used_in_batch_pos[pid] : 0.0;
@@ -940,24 +946,13 @@ void TriangleCyclePipeline::commit_stage_(const SignedGraphForMIP& G_) {
     }
     S_.H.swap(Hnew);
 
-    // (C) pool_count: accumulate accepted density on edges of accepted cuts
-    size_t pool_inc_nz = 0;
-    double pool_inc_sum = 0.0;
-    for (int eid = 0; eid < m; ++eid) {
-        double inc = round_.selected_count_full[eid];
-        if (inc != 0.0) { S_.pool_count[eid] += inc; ++pool_inc_nz; pool_inc_sum += inc; }
-    }
-
     // ── PROBE: summarize update magnitudes
     std::cout << "[COMMIT] omega_inc_nz=" << omega_inc_nz
               << " omega_inc_sum=" << omega_inc_sum
               << " clamp_min=" << omega_clamp_min
               << " clamp_max=" << omega_clamp_max
-              << " H_acc_nz=" << H_acc_nz
               << " H_rej_nz=" << H_rej_nz
               << " H_rej_sum=" << H_rej_sum
-              << " pool_inc_nz=" << pool_inc_nz
-              << " pool_inc_sum=" << pool_inc_sum
               << "\n";
 }
 

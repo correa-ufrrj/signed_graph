@@ -60,10 +60,6 @@ public:
     build_cycle_cuts_from_keys(IloEnv& env,
                                const std::vector<fmkey::CycleKey>& keys) const;
 
-    // Build triangle cuts that were buffered during the previous round.
-    std::vector<std::pair<IloRange, std::string>>
-    generate_pending_triangle_cuts(IloEnv& env, const TriangleInequalities& t) override;
-
     // Lightweight stats/telemetry for debugging the separation driver.
     void print_separation_stats(std::ostream& os) const;
 
@@ -92,9 +88,7 @@ private:
     void ensure_driver_();
 
     // ============================ Cut builders ===============================
-    IloRange generate_cycle_cut_standard(IloEnv& env, const std::vector<Edge>& all_edges) const;
-	IloRange generate_cycle_cut_reversed(IloEnv& env, const std::vector<Edge>& all_edges) const;
-    std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) override;
+    std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const override;
 
 public:
     // ============================== Callbacks ================================

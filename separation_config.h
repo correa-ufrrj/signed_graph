@@ -10,17 +10,17 @@ struct SeparationConfig {
     // ---------------------- Ranking & LP guidance ----------------------
     struct Ranking {
         double alpha       = 1.2;   // triangle primary score weight (1/ω′)
-        double theta       = 0.05;   // triangle salience blend
-        double lambda_hist = 0.2;  // historical repulsion blend (H)
-        double lambda_LP   = 0.9;  // LP salience blend (step 7+)
+        double theta       = 0.08;  // triangle salience blend
+        double lambda_hist = 0.4;  // historical repulsion blend (H)
+        double lambda_LP   = 0.5;  // LP salience blend (step 7+)
         double viol_tol    = 1e-6;
-        double inv_power   = 2.0;
+        double inv_power   = 1.0;
     } ranking;
 
     // ------------------------- Weight dynamics -------------------------
     struct Weights {
         double beta_emit = 0.5;    // within-batch ω′ bump per emit (used_density-scaled)
-        double beta_sel  = 0.05;    // cross-batch ω  drift per accepted edge
+        double beta_sel  = 0.2;    // cross-batch ω  drift per accepted edge
         double omega_eps = 1e-6;    // lower clamp for ω, ω′
         double omega_max = 32.0;    // upper clamp for ω
     } weights;
@@ -33,36 +33,32 @@ struct SeparationConfig {
         int tri_cap_per_vertex = 1; // per-vertex cap during selection
         // Shortest-path cycles (NCB)
         int B_sp             = 512;  // cycles budget (if used by driver)
-        int K_sp_per_neg     = 2;   // alt paths per negative anchor
-        int sp_cap_per_vertex= 8;   // per-vertex cap for SP acceptance
+        int K_sp_per_neg     = 1;   // alt paths per negative anchor
+        int sp_cap_per_vertex= 6;   // per-vertex cap for SP acceptance
     } budget;
 
     // ----------------------- Annealing for B_tri -----------------------
     struct AnnealTri {
 	    int    B_min     = 1;     // never drop below 1 via the multiplicative rule
-	    double gamma_min = 0.92;  // faster decay when v is high (but still gentle)
+	    double gamma_min = 0.90;  // faster decay when v is high (but still gentle)
 	    double gamma_max = 0.985; // very gentle decay when v is low
 	    double v0        = 0.25;  // target proxy-violation
-	    double tau       = 0.10;  // slower EMA
+	    double tau       = 0.15;  // slower EMA
     } anneal_tri;
 
     // ---------------------- EMA (H) & recent TTL -----------------------
     struct EMA {
-        double delta = 0.85;   // decay (0<delta<1)
-        double rho   = 0.02;   // accepted-weight
-        double kappa = 0.005;  // emitted-but-rejected weight
+        double delta = 0.992;   // decay (0<delta<1)
+        double rho   = 0.3;   // accepted-weight
+        double kappa = 0.15;  // emitted-but-rejected weight
         int    recent_ttl = 3; // stateless dedup TTL rounds
     } ema;
-    
-    // ---------------------- Reheat pool -----------------------
-	struct ReheatPool {
-	  int   reheat_stage_cap = 512;      // how many non-violated cycles we stage per round
-	  size_t reheat_pool_cap = 1000;    // global cap to keep memory bounded
-	  int   reheat_default_ttl = 3;      // TTL given to newly staged items
-	  double reheat_ema_alpha = 0.5;     // EMA smoothing for violation
-	  double reheat_ema_min_keep = 1e-4; // purge extremely cold items when trimming
-	} reheat;
 
+    // -------------------------- Modes / gating -------------------------
+    struct Modes {
+        bool use_triangles  = true;  // driver should set from FrustrationModel::TRIANGLE_CUTS
+        bool use_negcycles  = true;  // driver should set from FrustrationModel::NEGATIVE_CYCLE_CUTS
+    } modes;
 
     // ===================== Thin adapters for engines ====================
     // TriangleBucketBatch adapter

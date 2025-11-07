@@ -94,8 +94,7 @@ protected:
     double frustration_index(double obj_val) const;
 
     void initialize_uncut_triangles();
-    virtual std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) = 0;
-    virtual std::vector<std::pair<IloRange, std::string>> generate_pending_triangle_cuts(IloEnv& env, const TriangleInequalities& t) = 0;
+    virtual std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const = 0;
 //    std::vector<std::pair<IloRange, std::string>> generate_negative_cycle_cuts(IloEnv& env);
     std::vector<std::pair<IloRange, std::string>> generate_triangle_cuts(IloEnv& env);
     virtual void export_solution(const std::string& file_prefix, bool with_svg, std::vector<int> partition) const;

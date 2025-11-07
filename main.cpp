@@ -86,6 +86,13 @@ int main(int argc, char** argv) {
                 model = std::make_unique<ModularityModel>(g, cut_flags);
             }
 
+            if (auto* xy = dynamic_cast<FrustrationModelXY*>(model.get())) {
+			    SeparationConfig C;
+			    C.modes.use_triangles = (cut_flags & FrustrationModel::TRIANGLE_CUTS) != 0;
+			    C.modes.use_negcycles = (cut_flags & FrustrationModel::NEGATIVE_CYCLE_CUTS) != 0;
+			    xy->configure_separation(C);
+			}
+
             std::cout << "[Model] Created model." << std::endl;
             model->build();
             std::cout << "[Model] Built model." << std::endl;
