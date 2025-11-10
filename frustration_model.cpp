@@ -35,7 +35,7 @@ FrustrationModel::FrustrationModel(SignedGraphForMIP& g, int cut_flags)
     , signs(g.signs_view()) {
 
     m_minus = 0;
-    for (const auto& [_, sign, __] : signs) if (sign < 0) m_minus++;
+    for (const auto& [_, sign] : signs) if (sign < 0) m_minus++;
     const int m = graph.edge_count();
     signs0.resize(m);
     for (const auto& [e, idx] : edge_index) {

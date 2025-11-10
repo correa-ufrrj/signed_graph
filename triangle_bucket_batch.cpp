@@ -113,15 +113,6 @@ int TriangleBucketBatch::eid_(int a, int b) const {
     return (it == edge_index_.end()) ? -1 : it->second;
 }
 
-void TriangleBucketBatch::ensure_sorted_adjacency_() {
-    if (adj_sorted_) return;
-    for (auto& nbrs : const_cast<PosAdj&>(pos_adj_)) {
-        std::sort(nbrs.begin(), nbrs.end());
-        nbrs.erase(std::unique(nbrs.begin(), nbrs.end()), nbrs.end());
-    }
-    adj_sorted_ = true;
-}
-
 bool TriangleBucketBatch::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
     if (P_.cap_per_vertex <= 0) return true;
     if (c.w < 0 || c.w >= (int)used.size()) return false;

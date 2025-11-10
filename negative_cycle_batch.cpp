@@ -29,19 +29,6 @@ int ncb_budget(void* ctx, int base) {
     return static_cast<NegativeCycleBatch*>(ctx)->override_budget_(base);
 }
 
-// Simple scope guard for TBB hookup
-struct TBBHookScope {
-    TBBHookScope(void* ctx,
-                 void (*emit)(void*, int, double),
-                 void (*accept)(void*, int, double),
-                 int  (*budget)(void*, int)) {
-        TBB_set_active(ctx, emit, accept, budget);
-    }
-    ~TBBHookScope() {
-        TBB_clear_active();
-    }
-};
-
 // helper
 static inline long long key64_pair(int a, int b) {
     if (a > b) std::swap(a,b);
@@ -53,9 +40,8 @@ static inline long long key64_pair(int a, int b) {
 
 NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
                                        const std::vector<Edge>& neg_edges_uncov,
-                                       bool cover,
                                        Params p)
-    : P_(p), G_(G), cover_(cover)
+    : P_(p), G_(G)
 {
     tri_cap_per_vertex_ = P_.tri_cap_per_vertex;
     // seed the anchors directly from caller
@@ -66,16 +52,12 @@ NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
 // REFACTORED: this no longer fills neg_edges_ from the graph.
 // It builds positive graph, base weights, and then computes neg degrees from the provided anchors.
 // Delegating convenience constructors (compat overloads)
-NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
-                                       bool cover,
-                                       bool use_triangle_order)
-    : NegativeCycleBatch(G, G.get_negative_edges(), cover, Params{}) {}
+NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G)
+    : NegativeCycleBatch(G, G.get_negative_edges(), Params{}) {}
 
 NegativeCycleBatch::NegativeCycleBatch(const SignedGraphForMIP& G,
-                                       bool cover,
-                                       bool /*use_triangle_order*/,
                                        Params p)
-    : P_(p), G_(G), cover_(cover) {
+    : P_(p), G_(G) {
     tri_cap_per_vertex_ = P_.tri_cap_per_vertex;
     neg_edges_ = G.get_negative_edges();
     build_initial_state_();
@@ -91,32 +73,14 @@ void NegativeCycleBatch::build_initial_state_() {
     pos_deg_.assign((size_t)vcount_, 0);
 
     const auto& signs_view = G_.signs_view();
-    // NOTE: raw weights removed in new API; positivity decided via G_.is_pos_edge(eid)
-
-    std::vector<double> pos_bases; pos_bases.reserve((size_t)ecount_);
-    for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        if (!G_.is_pos_edge(eid)) continue; // positivity via SignedGraph semantics
-        const auto se = signs_view[eid];
-        ++pos_deg_[(size_t)se.points.first];
-        ++pos_deg_[(size_t)se.points.second];
-        pos_bases.push_back(1.0); // unit persistent base at init
-    }
-
-    if (!pos_bases.empty()) {
-        const size_t mid = pos_bases.size()/2;
-        std::nth_element(pos_bases.begin(), pos_bases.begin()+mid, pos_bases.end());
-        med_base_pos_ = std::max(1e-12, pos_bases[mid]);
-    } else {
-        med_base_pos_ = 1.0;
-    }
+    const auto  pos_eids = G_.get_positive_eids();           // vector<int>
 
     // Build positive-only graph and mappings
-    std::vector<igraph_integer_t> pos_edges; pos_edges.reserve((size_t)ecount_ * 2);
+    std::vector<igraph_integer_t> pos_edges; pos_edges.reserve(pos_eids.size() * 2);
     full2pos_eid_.assign((size_t)ecount_, -1);
-    pos2full_eid_.clear(); pos2full_eid_.reserve((size_t)ecount_);
+    pos2full_eid_.clear(); pos2full_eid_.reserve(pos_eids.size());
 
-    for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        if (G_.is_neg_edge(eid)) continue;
+    for (auto eid : pos_eids) {
         const auto se = signs_view[eid];
         igraph_integer_t u = se.points.first, v = se.points.second;
         full2pos_eid_[(size_t)eid] = (igraph_integer_t)pos2full_eid_.size();
@@ -174,33 +138,6 @@ void NegativeCycleBatch::build_mask_for_batch_() {
     }
     std::fill(reuse_accum_.begin(), reuse_accum_.end(), 0.0);
     used_in_batch_pos_.assign(pos2full_eid_.size(), 0.0);
-    alt_path_bump_ = std::max(1e-12, P_.alt_path_bump_scale * med_base_pos_);
-}
-
-void NegativeCycleBatch::build_pos_adj_and_index_(
-    TriangleBucketBatch::PosAdj& pos_adj,
-    TriangleBucketBatch::EdgeIndex& edge_index) const
-{
-    // Reset adjacency for |V|
-    pos_adj.assign((size_t)vcount_, {});
-    edge_index.clear();
-
-    const auto& sv = G_.signs_view();
-
-    // Map every (u,v) -> full eid; add only positive edges to adjacency
-    for (igraph_integer_t eid = 0; eid < ecount_; ++eid) {
-        const auto se = sv[eid];
-        const int u = (int)se.points.first;
-        const int v = (int)se.points.second;
-
-        edge_index.emplace(key64_pair(u, v), (int)eid);
-
-        // Positive means (>0) OR (+0). (−0) is treated as negative.
-        if (G_.is_pos_edge(eid)) {
-            pos_adj[(size_t)u].push_back(v);
-            pos_adj[(size_t)v].push_back(u);
-        }
-    }
 }
 
 int NegativeCycleBatch::override_budget_(int base) const {
@@ -212,11 +149,16 @@ void NegativeCycleBatch::on_emit_(int full_eid, double used_density) {
     if (full_eid < 0 || full_eid >= (int)full2pos_eid_.size()) return;
     igraph_integer_t pe = full2pos_eid_[(size_t)full_eid];
     if (pe < 0) return;
-    // Tiny bump proportional to median and used_density
-    const double bump = 0.05 * med_base_pos_ * std::max(0.0, used_density);
-    VECTOR(saved_weights_pos_)[pe] = std::max(1e-12, VECTOR(saved_weights_pos_)[pe] + bump);
-    // Track usage density for persistent (ω/H) updates at commit time
-    used_in_batch_pos_[(size_t)pe] += std::max(0.0, used_density);
+
+    used_density = std::max(0.0, used_density);
+    // accumulate usage for commit-stage mirrors
+    used_in_batch_pos_[(size_t)pe] += used_density;
+
+    // ω′_local ← ω′_local + β_emit · used_density  (pipeline contract)
+    double w = VECTOR(saved_weights_pos_)[pe] + P_.beta_emit * used_density;
+    if (w < P_.omega_eps) w = P_.omega_eps;
+    if (P_.omega_max > 0.0 && w > P_.omega_max) w = P_.omega_max;
+    VECTOR(saved_weights_pos_)[pe] = w;
 }
 
 void NegativeCycleBatch::on_accept_(int full_eid, double /*density*/) {
@@ -270,7 +212,6 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
     // === NO triangle-first step here anymore ===
     // The uncovered set is exactly what we were given at construction.
     std::vector<Edge> neg_edges_uncov = neg_edges_;
-    std::vector<Edge> new_disconnected; new_disconnected.reserve(neg_edges_uncov.size());
 
     // === SP-based generation on uncovered anchors (bucketed two-pass) ===
 	{
@@ -346,15 +287,46 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 				    }
 				}
 				
+				
+				// 1) Collect peids for all triangles u-w-v (positive graph)
+//				std::vector<igraph_integer_t> tri_peids;
+//				tri_peids.reserve(64);
+//				
+//				const auto W = G_.common_pos_neighbors((size_t)uu, (size_t)vv); // Bitmap
+//				for (size_t w_sz : W) {
+//				    const int w = (int)w_sz;
+//				    igraph_integer_t p1, p2;
+//				    if (igraph_get_eid(&g_pos_, &p1, uu, w, /*directed*/0, /*error*/0) == IGRAPH_SUCCESS)
+//				        tri_peids.push_back(p1);
+//				    if (igraph_get_eid(&g_pos_, &p2, w, vv, /*directed*/0, /*error*/0) == IGRAPH_SUCCESS)
+//				        tri_peids.push_back(p2);
+//				}
+				
+				// 2) Snapshot old weights and bump to a big value
+//				struct Saved { igraph_integer_t peid; double w; };
+//				std::vector<Saved> saved;
+//				saved.reserve(tri_peids.size());
+//				constexpr double BIG = 1e9;  // large finite weight
+//				
+//				for (auto peid : tri_peids) {
+//				    double &w = VECTOR(saved_weights_pos_)[peid];
+//				    saved.push_back({peid, w});
+//				    w *= 1.2;
+//				}
+				
+				// 3) Run Dijkstra with triangle edges penalized
 				igraph_vector_int_clear(&path);
-	            const auto t_dij0 = clock::now();
-	            igraph_get_shortest_path_dijkstra(&g_pos_, &path, nullptr, uu, vv, &saved_weights_pos_, IGRAPH_ALL);
-	            ms_dijkstra += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t_dij0).count();
+				const auto t0 = clock::now();
+				igraph_get_shortest_path_dijkstra(&g_pos_, &path, nullptr, uu, vv, &saved_weights_pos_, IGRAPH_ALL);
+				ms_dijkstra += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
 	            ++neg_edges_scanned;
+				
+				// 4) Restore weights (keep your usual per-path bumps afterwards as you already do)
+//				for (const auto& s : saved) VECTOR(saved_weights_pos_)[s.peid] = s.w;
 	
 	            const int nodes_on_path = igraph_vector_int_size(&path);
 	            if (nodes_on_path < 2) {
-	                new_disconnected.push_back(e_neg);
+					std::cout << "\n-\n\n";
 	                break;
 	            }
 	
@@ -396,17 +368,19 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	                buck_res.push_back(std::move(c));
 	
 	                // within-batch density + emit bump ∝ 1/|C|
-	                const double dens = 1.0 / std::max(1, nodes_on_path);
-	                for (auto peid : pos_peids) {
-	                    used_in_batch_pos_[(size_t)peid] += dens;
-	                    // approximate beta_emit: soft bump
-	                    VECTOR(saved_weights_pos_)[peid] = std::max(1e-12, VECTOR(saved_weights_pos_)[peid] + alt_path_bump_ * dens);
-	                }
+					const double dens = 1.0 / std::max(1, nodes_on_path);
+					for (size_t j = 0; j < pos_peids.size(); ++j) {
+					    const int full_eid = (int)full_eids[j];
+					    on_emit_(full_eid, dens); // updates used_in_batch_pos_ and bumps ω′ with β_emit and clamps
+					}
 	            } else {
 	                // discourage same path; larger bump
-	                for (auto peid : pos_peids) {
-	                    VECTOR(saved_weights_pos_)[peid] = std::max(1e-12, VECTOR(saved_weights_pos_)[peid] + 2.0 * alt_path_bump_);
-	                }
+					for (auto peid : pos_peids) {
+					    double w = VECTOR(saved_weights_pos_)[peid] + 2.0 * P_.beta_emit;
+					    if (w < P_.omega_eps) w = P_.omega_eps;
+					    if (P_.omega_max > 0.0 && w > P_.omega_max) w = P_.omega_max;
+					    VECTOR(saved_weights_pos_)[peid] = w;
+					}
 	            }
 	        }
             igraph_vector_int_destroy(&path);
@@ -513,17 +487,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	}
 	
 	++batches_emitted_;
-
-    const bool made_progress = (total_found_ > before_total);
-    if (!made_progress) {
-        finished_ = true;
-    } else if (cover_) {
-        // Keep only negatives that failed to produce any path under SP (disconnected)
-        neg_edges_.swap(new_disconnected);
-        if (neg_edges_.empty()) finished_ = true;
-    } else {
-        finished_ = true;
-    }
+    finished_ = true;
 
     std::cout << "[TRI_CYC-PROFILE] negE_scanned=" << neg_edges_scanned
     		  << ", K_sp_per_neg=" << P_.K_sp_per_neg

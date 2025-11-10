@@ -27,7 +27,7 @@ void FrustrationModelX::build() {
 
     // Initial solution using greedy switching
 	SignedGraph sg_sw = graph.greedy_switching();       // switched graph (by value)
-	const auto& s = sg_sw.switching_vector();           // std::vector<double>, values in [-1,+1]
+//	const auto& s = sg_sw.switching_vector();           // std::vector<double>, values in [-1,+1]
 
     // Improving inequalities, if required
     if (use_cut_generator != NO_CUTS) {
@@ -99,7 +99,7 @@ void FrustrationModelX::build() {
     for (int i = 0; i < n; ++i) {
         model.add(x[i]);
         vars.add(x[i]);
-        start_vals.add(static_cast<IloNum>(s[i]));
+        start_vals.add(graph.get_x(i));
     }
 
     auto fe = graph.frustrated_edges();
@@ -118,8 +118,8 @@ void FrustrationModelX::build() {
     cplex.addMIPStart(vars, start_vals);
     injected_heuristic_solutions++;
 
-    igraph_integer_t max_vertex = graph.max_degree_vertex();
-    model.add(x[max_vertex] == s[max_vertex]);
+    igraph_integer_t max_vertex = graph.max_pos_degree_vertex();
+    model.add(x[max_vertex] == graph.get_x(max_vertex));
 }
 
 std::vector<std::pair<IloRange, std::string>> FrustrationModelX::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const {
@@ -211,7 +211,7 @@ FrustrationModelX::generate_edge_partition_ineq(const IloNumArray& x_vals) {
     std::vector<std::pair<int, int>> ordered_pairs;
     std::vector<std::pair<int, int>> undecided_pairs;
 
-    for (const auto& [edge, sign, _] : signs) {
+    for (const auto& [edge, sign] : signs) {
         int u = edge.first;
         int v = edge.second;
         double xu = x_vals[u];

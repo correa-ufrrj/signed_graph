@@ -12,6 +12,7 @@
 #include <functional>
 #include <utility>
 #include <edge.h>
+#include <signed_graph.h>
 
 // Design:
 //  - Iterate negative edges (anchors) under the *current switched signs*
@@ -76,7 +77,7 @@ public:
 
     // Simple adjacency for G^+_σ: pos_adj[u] = list of neighbors (v) with (u,v) \in E^+_σ
     // Edge index map: undirected (min(u,v), max(u,v)) -> EdgeId (e.g., y-index)
-    using PosAdj = std::vector<std::vector<VertexId>>;
+    using PosAdj = std::vector<GraphCore::Bitmap>;
     using EdgeIndex = std::unordered_map<long long, EdgeId>;
 
     // Settings (caps/truncation)
@@ -147,7 +148,6 @@ private:
     // Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
     static long long key_(VertexId a, VertexId b);
     EdgeId eid_(VertexId a, VertexId b) const;
-    void ensure_sorted_adjacency_();
     bool respect_cap_(const Candidate& c, const std::vector<int>& used) const;
     bool already_taken_(const Candidate& c) const;
     void commit_(const Candidate& c, std::vector<int>& used);
@@ -163,39 +163,37 @@ private:
     std::unordered_set<std::tuple<VertexId,VertexId,VertexId>, tbb_detail::TupleHash, tbb_detail::TupleEq> taken_;
     Stats stats_; // <- new lightweight stats holder
 };
+
 // --- Template implementation ---
+// 3) build_buckets: iterate set bits from the bitmap instead of merging two sorted vectors
 template <class Scorer>
 inline void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
-    // Do not clear: allow reheat-preseeded buckets (buck^(0)) to participate
-    // buckets_.clear();
-    ensure_sorted_adjacency_();
+    // ensure_sorted_adjacency_(); // ← delete/no-op
 
-    for (const auto& uv : neg_edges_) {
-        VertexId u = uv.first;
-        VertexId v = uv.second;
-        EdgeId neg_eid = eid_(u, v);
+    const int A = (int)neg_edges_.size();
+    for (int i = 0; i < A; ++i) {
+        const auto [u, v] = neg_edges_[i];
+        const EdgeId neg_eid = eid_(u, v);
         if (neg_eid < 0) continue;
 
-        // common neighbors in G^+_σ: N^+(u) ∩ N^+(v)
-        const auto& Nu = pos_adj_[u];
-        const auto& Nv = pos_adj_[v];
-        std::vector<VertexId> W;
-        W.reserve(std::min(Nu.size(), Nv.size()));
-        std::set_intersection(Nu.begin(), Nu.end(), Nv.begin(), Nv.end(), std::back_inserter(W));
-
         auto& buck = buckets_[neg_eid];
-        for (VertexId w : W) {
+
+        // W = N⁺(u) ∩ N⁺(v), precomputed by caller as a bitmap
+        const auto& Wbm = pos_adj_[i];
+        for (auto w_as_size_t : Wbm) {
+            const VertexId w = (VertexId)w_as_size_t;
+
             Candidate c;
             c.u = u; c.v = v; c.w = w;
             c.neg_eid    = neg_eid;
             c.pos_eid_uw = eid_(u, w);
             c.pos_eid_wv = eid_(w, v);
             if (c.pos_eid_uw < 0 || c.pos_eid_wv < 0) continue;
+
             scorer(c);
             buck.push_back(std::move(c));
         }
 
-        // Sort by (primary desc, then secondary desc)
         std::sort(buck.begin(), buck.end(),
                   [](const Candidate& a, const Candidate& b){
                       if (a.score_primary != b.score_primary) return a.score_primary > b.score_primary;
@@ -205,14 +203,14 @@ inline void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
             buck.resize(P_.K_tri_per_neg);
         }
     }
-    // Now compute the light stats without exposing internals
-    int nonempty = 0;
-    long long total = 0;
-    for (const auto& bucket : buckets_) { // assume internal: std::vector<std::vector<Candidate>> buckets_;
-	    const auto& vec = bucket.second;
-	    if (!vec.empty()) ++nonempty;
-	    total += static_cast<long long>(vec.size());
-	}
+
+    // stats
+    int nonempty = 0; long long total = 0;
+    for (const auto& kv : buckets_) {
+        const auto& vec = kv.second;
+        if (!vec.empty()) ++nonempty;
+        total += (long long)vec.size();
+    }
     stats_.buckets_nonempty = nonempty;
     stats_.candidates       = total;
 }

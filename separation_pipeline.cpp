@@ -531,86 +531,83 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
         key2eid[key64(e.first, e.second)] = eid;
     }
 
-    // Positive adjacency + list of negative anchors under current switching
-    TriangleBucketBatch::PosAdj pos_adj(n);
-    {
-        // Build E⁺ adjacency from helper (current switched signature)
-        auto pos_edges = G_.get_positive_edges();
-        for (const auto& e : pos_edges) {
-            pos_adj[e.first].push_back(e.second);
-            pos_adj[e.second].push_back(e.first);
-        }
+    // --------- NEW: build anchors & per-anchor intersections as bitmaps ----------
+    // Raw negative edges under current switching (edges, not eids)
+    const auto neg_edges_raw = G_.get_negative_edges();
+
+    // Gather saliences per full-eid to gate anchors
+    std::vector<double> neg_sals;
+    neg_sals.reserve(neg_edges_raw.size());
+    for (const auto& e : neg_edges_raw) {
+        const int feid = key2eid[key64(e.first, e.second)];
+        neg_sals.push_back(round_.sal_full[feid]);
     }
-    // Negative anchors (full edges) under current switching
-	auto neg_eids = G_.get_negative_eids();
-	std::vector<double> neg_sals;
-	neg_sals.reserve(neg_eids.size());
-	double mean = 0.0;
-	for (int feid : neg_eids) { double s = round_.sal_full[feid]; neg_sals.push_back(s); mean += s; }
-	const int neg_raw = (int)neg_eids.size();
-	mean = (neg_raw ? mean / neg_raw : 0.0);
-	
-	// F: p70 gate + mean fallback
-	const double p70 = percentile_of(neg_sals, 0.70);
-	const double sal_min_fallback = std::max(p70, 0.5 * mean);
-	
-	std::vector<Edge> neg_edges;                 // FIX: no pre-size
-	neg_edges.reserve(neg_eids.size() / 1.5);          // capacity only
-	const auto& sv = G_.signs_view();
-	int nsel = 0;
-	for (int feid : neg_eids) {
-	    if (round_.sal_full[feid] < sal_min_fallback) continue;  // skip anchors not fractional enough
-	    const auto& p = sv[feid].points;
-	    neg_edges.emplace_back((int)p.first, (int)p.second);
-	    ++nsel;
-	}
-	
-	std::cout << "[TBB-FILTER] negE_raw=" << neg_raw
-	          << " negE_keep=" << nsel
-	          << " sal_fallback=" << sal_min_fallback << " (p70=" << p70 << ", mean=" << mean << ")\n";
+
+    const int neg_raw = (int)neg_edges_raw.size();
+    double mean = 0.0;
+    for (double s : neg_sals) mean += s;
+    mean = (neg_raw ? mean / neg_raw : 0.0);
+
+    const double p70 = percentile_of(neg_sals, 0.70);
+    const double sal_min_fallback = std::max(p70, 0.5 * mean);
+
+    std::vector<Edge> neg_edges;
+    neg_edges.reserve(neg_edges_raw.size());
+    TriangleBucketBatch::PosAdj pos_adj;                     // vector<GraphCore::Bitmap>
+    pos_adj.reserve(neg_edges_raw.size());
+
+    int nsel = 0;
+    for (const auto& e : neg_edges_raw) {
+        const int feid = key2eid[key64(e.first, e.second)];
+        if (round_.sal_full[feid] < sal_min_fallback) continue;
+
+        neg_edges.emplace_back(e);
+        // Precompute W = N⁺(u) ∩ N⁺(v) as a bitmap (fast later enumeration)
+        pos_adj.emplace_back(G_.common_pos_neighbors(e));
+        ++nsel;
+    }
+
+    std::cout << "[TBB-FILTER] negE_raw=" << neg_raw
+              << " negE_keep=" << nsel
+              << " sal_fallback=" << sal_min_fallback
+              << " (p70=" << p70 << ", mean=" << mean << ")\n";
 
     // Params from config (respect defaults)
     TriangleBucketBatch::Params P = C_.to_tbb_params();
 
-    // Annealed triangle budget (effective)
+    // Annealed triangle budget (effective), unchanged
     if (P.B_tri <= 0) P.B_tri = std::max(1, (int)neg_edges.size());
-    const int P_before = P.B_tri;
-    if (S_.B_tri_cur > 0) P.B_tri = std::min(P.B_tri, S_.B_tri_cur);
-
-	const int base_B = C_.budget.B_tri;
-	// Use annealed budget if available; otherwise fall back to base on first round(s)
-	const int B_eff_this_round = (S_.B_tri_cur > 0 ? std::min(base_B, S_.B_tri_cur) : base_B);
-	
-	P.B_tri = std::min(P.B_tri, B_eff_this_round); // keep existing min w/ TBB param
+    const int base_B = C_.budget.B_tri;
+    const int B_eff_this_round = (S_.B_tri_cur > 0 ? std::min(base_B, S_.B_tri_cur) : base_B);
+    P.B_tri = std::min(P.B_tri, B_eff_this_round);
 
     TriangleBucketBatch tbb(neg_edges, pos_adj, key2eid, P);
 
-	// Scorer: primary = α * (1 / Hmean(ω′ on positive edges of tri)) + θ·φ
-	auto scorer = [&](TriangleBucketBatch::Candidate& c){
-	    const int pid_uw = (c.pos_eid_uw >= 0 && c.pos_eid_uw < (int)Gt_.full2pos.size())
-	                       ? Gt_.full2pos[c.pos_eid_uw] : -1;
-	    const int pid_wv = (c.pos_eid_wv >= 0 && c.pos_eid_wv < (int)Gt_.full2pos.size())
-	                       ? Gt_.full2pos[c.pos_eid_wv] : -1;
-	
-		const double p = std::max(1.0, C_.ranking.inv_power);
-		auto w_at = [&](int pid) {
-		    return std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
-		};
-		
-		double inv_hmean = 0.0;
-		if (pid_uw >= 0 && pid_wv >= 0) {
-		    const double w1 = w_at(pid_uw), w2 = w_at(pid_wv);
-		    // If you want exactly α / Hmean(w): set C_.ranking.inv_power = 1.0
-		    if (p == 1.0) {
-		        inv_hmean = 0.5 * (1.0 / w1 + 1.0 / w2);   // = 1 / Hmean(w1,w2)
-		    } else {
-		        inv_hmean = 0.5 * (std::pow(w1, -p) + std::pow(w2, -p)); // stronger tilt to small ω′
-		    }
-		}
-		c.score_primary = C_.ranking.alpha * inv_hmean + C_.ranking.theta * c.phi;	    
-	    c.score_secondary = 0.0;
-	    c.viol = 0.0; // reserved for later violation-aware scoring
-	};
+    // Scorer (unchanged)
+    auto scorer = [&](TriangleBucketBatch::Candidate& c){
+        const int pid_uw = (c.pos_eid_uw >= 0 && c.pos_eid_uw < (int)Gt_.full2pos.size())
+                           ? Gt_.full2pos[c.pos_eid_uw] : -1;
+        const int pid_wv = (c.pos_eid_wv >= 0 && c.pos_eid_wv < (int)Gt_.full2pos.size())
+                           ? Gt_.full2pos[c.pos_eid_wv] : -1;
+
+        const double p = std::max(1.0, C_.ranking.inv_power);
+        auto w_at = [&](int pid) {
+            return std::max(C_.weights.omega_eps, round_.omega_prime_pos[pid]);
+        };
+
+        double inv_hmean = 0.0;
+        if (pid_uw >= 0 && pid_wv >= 0) {
+            const double w1 = w_at(pid_uw), w2 = w_at(pid_wv);
+            if (p == 1.0) {
+                inv_hmean = 0.5 * (1.0 / w1 + 1.0 / w2);
+            } else {
+                inv_hmean = 0.5 * (std::pow(w1, -p) + std::pow(w2, -p));
+            }
+        }
+        c.score_primary   = C_.ranking.alpha * inv_hmean + C_.ranking.theta * c.phi;
+        c.score_secondary = 0.0;
+        c.viol = 0.0;
+    };
 
     // Build buckets and probe TBB stats before selection
     tbb.build_buckets(scorer);
@@ -813,7 +810,7 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
 	          << "% (min=" << min << ", max=" << max << ", p70=" << p70 << ", mean=" << mean << ")\n";
     if (kept == 0) { std::cout << "[SP-GATE] kept_for_sp=0 → skipping SP stage.\n"; return; }
 
-    NegativeCycleBatch ncb(G_, neg_uncov, /*cover=*/false, C_.to_ncb_params());
+    NegativeCycleBatch ncb(G_, neg_uncov, C_.to_ncb_params());
 
     std::vector<NegativeCycle> batch;
     while (ncb.next(batch)) {
@@ -832,9 +829,13 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
 
             // Density ~ 1/L where L = number of nodes on the pos path
             const int L_nodes = (int)cyc.pos_edges().size() + 1;
+            int sal_nodes = G_.vertex_salience(cyc.neg_edge().first) + G_.vertex_salience(cyc.neg_edge().second); //(int)cyc.pos_edges().size() + 1;
+            for (const auto& pe : cyc.pos_edges()) {
+				sal_nodes += G_.vertex_salience(pe.first) + G_.vertex_salience(pe.second);
+			}
             ++lnodes_hist[L_nodes];
             ++accepted_in_batch;
-            const double dens = 1.0 / std::max(1, L_nodes);
+            const double dens = sal_nodes / (2.0 * std::max(1, L_nodes));
 
             // Bump along positive path edges (FULL-ids) and mirror to POS-domain used mask
             for (const auto& pe : cyc.pos_edges()) {

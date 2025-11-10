@@ -19,7 +19,7 @@ struct SeparationConfig {
 
     // ------------------------- Weight dynamics -------------------------
     struct Weights {
-        double beta_emit = 0.5;    // within-batch ω′ bump per emit (used_density-scaled)
+        double beta_emit = 0.8;    // within-batch ω′ bump per emit (used_density-scaled)
         double beta_sel  = 0.2;    // cross-batch ω  drift per accepted edge
         double omega_eps = 1e-6;    // lower clamp for ω, ω′
         double omega_max = 32.0;    // upper clamp for ω
@@ -77,9 +77,13 @@ struct SeparationConfig {
 	    p.K_sp_per_neg       = budget.K_sp_per_neg;
 	    p.sp_cap_per_vertex  = budget.sp_cap_per_vertex;
 	    p.tri_cap_per_vertex = budget.tri_cap_per_vertex;
-	    p.alt_path_bump_scale = 1.0;              // default: keep current behavior
 	    p.cross_batch_penalty_scale = 3.0;        // default drift
 	    p.tbb = to_tbb_params();                  // pass through triangle knobs for NCB's internal TBB
+
+	    // unify with triangle contract
+	    p.beta_emit  = weights.beta_emit;
+	    p.omega_eps  = weights.omega_eps;
+	    p.omega_max  = weights.omega_max;
 	    return p;
 	}
 };

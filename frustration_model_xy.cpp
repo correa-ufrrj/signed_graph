@@ -72,7 +72,7 @@ void FrustrationModelXY::build() {
     {
         IloExpr obj(env);
         for (int i = 0; i < n; ++i) obj += (d_plus[i] - d_minus[i]) * x[i];
-        for (const auto& [e, sgn, _] : signs) obj += -2.0 * sgn * y[edge_index[e]];
+        for (const auto& [e, sgn] : signs) obj += -2.0 * sgn * y[edge_index[e]];
         objective = IloMinimize(env, obj);
         model.add(objective);
         obj.end();
@@ -81,7 +81,7 @@ void FrustrationModelXY::build() {
     // ============ Base formulation (edge constraints) ============
     {
         IloRangeArray base(env);
-        for (const auto& [e, sgn, _] : signs) {
+        for (const auto& [e, sgn] : signs) {
             const int u = e.first, v = e.second;
             const int idx = edge_index[e];
             if (sgn > 0) {
@@ -112,7 +112,7 @@ void FrustrationModelXY::build() {
 	            E += (double)dsig * x[u];
 	
 	            // Sum over edges incident to u, using σ(u,v) ∈ {+1,-1}
-	            for (const auto& [e, sgn, _] : signs) {
+	            for (const auto& [e, sgn] : signs) {
 	                if (e.first == u || e.second == u) {
 	                    const int v   = (e.first == u) ? e.second : e.first;
 	                    const int idx = edge_index[e];
@@ -130,6 +130,75 @@ void FrustrationModelXY::build() {
 	    net_degree_cut_count += added;
 	    std::cout << "[INIT-NETDEG] eligible=" << eligible
 	              << " added=" << added << "\n";
+	              
+	    // dsig[u] = d^+_σ(u) - d^-_σ(u)
+	    std::vector<int> dsig(n);
+	    for (int u = 0; u < n; ++u)
+	        dsig[u] = static_cast<int>(d_plus[u] - d_minus[u]);
+	
+	    // Lightweight adjacency & sign lookups
+	    std::vector<int> sgn_of_eid(m, 0);                 // σ(eid) ∈ {±1}
+	    std::vector<std::vector<int>> inc_eids(n);         // incident eids per vertex
+	    inc_eids.reserve(n);
+	    std::vector<Edge> eid2edge(m);                     // endpoints per eid
+	
+	    for (const auto& [e, sgn] : signs) {
+	        const int eid = edge_index[e];
+	        sgn_of_eid[eid] = sgn;
+	        eid2edge[eid] = e;
+	        inc_eids[e.first ].push_back(eid);
+	        inc_eids[e.second].push_back(eid);
+	    }
+	
+	    int added_edge_anchored = 0;
+	    int scanned_pos = 0;
+	
+	    // Anchor at positive edges only
+	    for (const auto& [e, sgn] : signs) {
+//	        if (sgn <= 0) continue;         // only σ(u,v)=+1 anchors
+	        const int u = e.first, v = e.second;
+	
+	        // d'_u, d'_v exclude uv (σ(u,v)=+1 ⇒ subtract 1)
+	        const int dpu = dsig[u] - 1;
+	        const int dpv = dsig[v] - 1;
+	
+	        // Keep only edges with odd parity d'_u + d'_v
+	        if ( ((dpu + dpv) & 1) == 0 ) continue;
+	        ++scanned_pos;
+	
+	        // RHS = floor((d'_u + d'_v)/2)
+	        const int rhs = static_cast<int>(std::floor(0.5 * static_cast<double>(dpu + dpv)));
+	
+	        IloExpr EA(env);
+	        EA += static_cast<double>(dpu) * x[u]
+	            + static_cast<double>(dpv) * x[v];
+	
+	        // L_u part: sum over w ≠ v along edges incident to u
+	        for (int eid : inc_eids[u]) {
+	            const Edge& ew = eid2edge[eid];
+	            const int w = (ew.first == u ? ew.second : ew.first);
+	            if (w == v) continue; // exclude uv entirely
+	            const int s = sgn_of_eid[eid]; // σ(u,w)
+	            EA -= (2.0 * y[eid] - x[w]) * static_cast<double>(s);
+	        }
+	
+	        // L_v part: sum over w ≠ u along edges incident to v
+	        for (int eid : inc_eids[v]) {
+	            const Edge& ew = eid2edge[eid];
+	            const int w = (ew.first == v ? ew.second : ew.first);
+	            if (w == u) continue; // exclude uv entirely
+	            const int s = sgn_of_eid[eid]; // σ(v,w)
+	            EA -= (2.0 * y[eid] - x[w]) * static_cast<double>(s);
+	        }
+	
+	        model.add(EA <= static_cast<double>(rhs));
+	        EA.end();
+	        ++added_edge_anchored;
+	    }
+	
+	    std::cout << "[INIT-NETDEG-EDGE+ODD] scanned_pos=" << scanned_pos
+	              << " added=" << added_edge_anchored << "\n";
+
 	}
 
     // ============ Greedy switching ============
@@ -630,7 +699,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 	    double base_max = 0.0, netdeg_max = 0.0;
 	
 	    // Base constraints
-	    for (const auto& [e, sgn, _] : sg.signs_view()) {
+	    for (const auto& [e, sgn] : sg.signs_view()) {
 	        int u=e.first, v=e.second, idx=owner.edge_index[e];
 	        double xu = val(owner.x[u]), xv = val(owner.x[v]), yuv = val(owner.y[idx]);
 	
@@ -670,7 +739,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 }
 
 void FrustrationModelXY::configure_separation(const SeparationConfig& cfg) {
-	std::cout << "[CONFIGURE SEPARATION] use_triangles=" << cfg.modes.use_triangles << "\n";
+	std::cout << "[CONFIGURE SEPARATION] use_triangles=" << cfg.modes.use_triangles << " use_negcyles=" << cfg.modes.use_negcycles << "\n";
     sep_cfg_ = cfg;
     driver_.reset();
 }

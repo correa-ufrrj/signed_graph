@@ -14,7 +14,6 @@
 #include <algorithm>
 
 #include "triangle_bucket_batch.h"
-#include "reheat_pool.h"
 
 // Forward declarations (C linkage) for TBB hooks used by TriangleBucketBatch.
 // These are defined with strong linkage in negative_cycle_batch.cpp.
@@ -32,7 +31,6 @@ public:
         int    K_sp_per_neg       = 3;    // alt paths per negative anchor
         int    sp_cap_per_vertex  = 8;    // per-vertex cap for accepted SP cycles
         int    tri_cap_per_vertex = 6;    // cap reused when NCB enforces per-vertex limits in triangle-first accept
-        double alt_path_bump_scale = 1.0; // scales med_base_pos_ to get alt_path_bump_
         double cross_batch_penalty_scale = 3.0; // drift base_pos_ when cycles are accepted
         TriangleBucketBatch::Params tbb{}; // pass-through for the internal triangle stage
 
@@ -41,6 +39,11 @@ public:
         // If provided, these values are copied into saved_weights_pos_ and
         // used directly by Dijkstra for path finding.
         const std::vector<double>* guide_len_full = nullptr;
+
+	    // new: use same knobs as pipeline for emit bumps and clamps
+	    double beta_emit  = 0.5;   // ← SeparationConfig.weights.beta_emit
+	    double omega_eps  = 1e-12; // ← SeparationConfig.weights.omega_eps (min)
+	    double omega_max  = 0.0;   // 0 = no cap; else clamp to this
 
         // Min length for numerical stability
         double guide_len_eps = 1e-12;
@@ -62,16 +65,11 @@ public:
 
 	NegativeCycleBatch(const SignedGraphForMIP& G,
 	                   const std::vector<Edge>& neg_edges_uncov,
-	                   bool cover,
 	                   Params p);
 	// negative_cycle_batch.h  (only the constructor declarations shown here)
-	explicit NegativeCycleBatch(const SignedGraphForMIP& G,
-	                            bool cover,
-	                            bool use_triangle_order = false);
+	explicit NegativeCycleBatch(const SignedGraphForMIP& G);
 	
 	explicit NegativeCycleBatch(const SignedGraphForMIP& G,
-	                            bool cover,
-	                            bool use_triangle_order,
 	                            Params p);
     bool next(std::vector<NegativeCycle>& out);
 
@@ -105,17 +103,14 @@ private:
     std::vector<double> base_pos_;
     std::vector<double> neg_hard_;
     std::vector<double> reuse_accum_;
-    double              med_base_pos_{1.0};
 
     // Negative edges (anchors) under current switching; may shrink when cover_==true
     std::vector<Edge>   neg_edges_;
-    std::vector<Edge>   disconnected_;
 
     // Saved working masks (full graph and pos-only)
     igraph_vector_t     saved_weights_{};
     bool                saved_weights_init_{false};
 
-    bool                cover_{false};
     bool                finished_{false};
     size_t              total_found_{0};
     int                 batches_emitted_{0};
@@ -153,16 +148,8 @@ private:
     void build_initial_state_();
     void build_mask_for_batch_();
 
-    void build_pos_adj_and_index_(
-        TriangleBucketBatch::PosAdj& pos_adj,
-        TriangleBucketBatch::EdgeIndex& edge_index) const;
-
     // ---------- Bridges for within-batch/cross-batch updates ------------
     void on_emit_(int full_eid, double used_density);   // within-batch ω'_t bump
     void on_accept_(int full_eid, double density);      // cross-batch ω drift
     int  override_budget_(int base) const;              // annealing hook (kept simple)
-
-    // allow k alternate shortest paths per neg edge (soft mask)
-    
-    double alt_path_bump_ = 1.0; // scaled from med_base_pos_ at build
 };

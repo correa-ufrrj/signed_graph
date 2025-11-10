@@ -15,20 +15,41 @@ class NegativeCycleBatch;
 // (iii) Parameterized by xhat ∈ [0,1]^V.
 // (iv) s[u] = 2*xhat[u] − 1.
 // (v)  Default xhat is unit (all ones) ⇒ s ≡ +1.
+// Fractional polarity layer:
+//  - polarity_of(u,v,eid) = s[u]*sigma[eid]*s[v] ∈ [−1, +1] (s ∈ [−1,1]^V).
+//  - dtilde_pos_[u] = Σ_v max(0, polarity_of(u,v)), dtilde_neg_[u] = Σ_v max(0, −polarity_of(u,v)).
+//  - on_switch_sign_changed_(u, from, to, ...):
+//       * first calls base SignedGraph::on_switch_sign_changed_ for (+/−) structure.
+//       * then updates (dtilde_pos_, dtilde_neg_) by per-edge deltas using σ via GraphCore::sign_of.
+//       * does not touch sigma_ directly; no division by 'from' or 'to'.
 class SignedGraphForMIP : public SignedGraph {
 private:
+    // Cached polarity-degree decompositions:
+    // d̃⁺[u] = Σ_v max(0, p_uv), d̃⁻[u] = Σ_v max(0, -p_uv), p_uv = s[u]*σ_uv*s[v]
+    std::vector<double> dtilde_pos_;
+    std::vector<double> dtilde_neg_;
+
 	// Helper: compute x = (s + 1)/2
     inline double x_from_s_(double s) const { return (s + 1.0) / 2.0; }
-	// Helper: round a switching vector to ±1 in-place (0 → +1)
-	inline double round_pm1_(double s) const {
-	    return is_pos_(s) ? +1.0 : -1.0;
-	}
-	inline void round_pm1_inplace(std::vector<double>& s) const {
-	    for (double& x : s) x = round_pm1_(x);
-	}
+
+	// polarity_if(u,v,su): counterfactual polarity for edge (u,v)
+	// if s[u] were su, keeping s[v] fixed. Uses raw σ via GraphCore::sign_of.
+    inline double polarity_if(int u, int v, double su) const {
+        return su * GraphCore::sign_of(u, v) * s_[v];
+    }
+    inline double polarity_if(int u, int v, int eid, double su) const {
+        return su * GraphCore::sign_of(u, v, eid) * s_[v];
+    }
+    inline double polarity_of(int u, int v, int eid) const {
+        return s_[u] * GraphCore::sign_of(u, v, eid) * s_[v];
+    }
+    inline double polarity_of(const Edge& e) const {
+        return polarity_if(e.first, e.second, s_[e.first]);
+    }
+	void on_switch_sign_changed_(int u, double from, double to, igraph_vector_int_t* incident) override;
 
 public:
-    using SignedGraph::apply_compose_switching;
+    using SignedGraph::compose_switching_inplace;
 
     struct GreedyKickOptions {
         int    neg_edge_threshold_abs = -1;
@@ -49,33 +70,27 @@ public:
     class EdgePolarityView {
     private:
         const igraph_t* g;
-        const SignedGraphForMIP* sg;
+        const SignedGraphForMIP* core;
     public:
         struct const_iterator {
-            const igraph_t* g; igraph_integer_t eid; const SignedGraphForMIP* sg;
-            using value_type = std::pair<Edge, double>;
+            const igraph_t* g; igraph_integer_t eid; const SignedGraphForMIP* core;
+            using value_type = EdgePolarity;
             value_type operator*() const {
                 igraph_integer_t u,v; igraph_edge(g, eid, &u, &v);
-                const double p = sg->switching_vector()[(int)u]
-                                 * static_cast<double>(sg->get_sigma()[(int)eid])
-                                 * sg->switching_vector()[(int)v];
-                return { Edge{ (int)u,(int)v }, p };
+                return { Edge{ (int)u, (int)v }, core->polarity_of(u, v, eid) };
             }
             const_iterator& operator++() { ++eid; return *this; }
             bool operator!=(const const_iterator& o) const { return eid != o.eid; }
         };
-        explicit EdgePolarityView(const SignedGraphForMIP* sg_, const igraph_t* graph) : g(graph), sg(sg_) {}
-        const_iterator begin() const { return const_iterator{ g, 0, sg }; }
-        const_iterator end()   const { return const_iterator{ g, igraph_ecount(g), sg }; }
-        inline double operator[](igraph_integer_t e) const {
-            igraph_integer_t u,v; igraph_edge(g, e, &u, &v);
-            return sg->switching_vector()[(int)u]
-                 * static_cast<double>(sg->get_sigma()[(int)e])
-                 * sg->switching_vector()[(int)v];
+        explicit EdgePolarityView(const SignedGraphForMIP* sg_, const igraph_t* graph) : g(graph), core(sg_) {}
+        const_iterator begin() const { return const_iterator{ g, 0, core }; }
+        const_iterator end()   const { return const_iterator{ g, igraph_ecount(g), core }; }
+        inline EdgePolarity operator[](igraph_integer_t eid) const {
+            igraph_integer_t u,v; igraph_edge(g, eid, &u, &v);
+            return { Edge{ (int)u, (int)v }, core->polarity_of(u, v, eid) };
         }
-        inline double operator[](const Edge& e) const {
-            igraph_integer_t eid; if (igraph_get_eid(g, &eid, e.first, e.second, 0, 0) != IGRAPH_SUCCESS) return 0.0;
-            return (*this)[eid];
+        inline EdgePolarity operator[](const Edge& e) const {
+            return { e, core->polarity_of(e) };
         }
         int size() const { return igraph_ecount(g); }
     };
@@ -113,7 +128,7 @@ public:
     template<class Vec>
     SignedGraphForMIP compose_switching(const Vec& s) {
         SignedGraphForMIP out(this);   // copy MIP directly (reuses g_, sigma_, s_)
-        out.apply_compose_switching(s); // updates s_ and recomputes degrees
+        out.compose_switching_inplace(s); // updates s_ and recomputes degrees
         return out;
     }
 
@@ -130,5 +145,5 @@ public:
     const std::vector<double> edge_polarities() const;
 
     // Stream factory
-    NegativeCycleBatch open_negative_cycle_stream(bool cover, bool use_triangle_order = false) const;
+    NegativeCycleBatch open_negative_cycle_stream() const;
 };

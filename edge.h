@@ -30,10 +30,20 @@ std::ostream& operator<<(std::ostream& os, const Edge& e);
 struct SignedEdge {
     Edge points;
     int  sign;
-    double salience; // in [0,1]
 
     bool operator==(const SignedEdge& other) const {
-        // Equality by undirected endpoints only (ignore sign/salience)
+        // Equality by undirected endpoints only (ignore sign)
+        return (points.first == other.points.first && points.second == other.points.second) ||
+               (points.first == other.points.second && points.second == other.points.first);
+    }
+};
+
+struct EdgePolarity {
+    Edge points;
+    double  polarity;
+
+    bool operator==(const EdgePolarity& other) const {
+        // Equality by undirected endpoints only (ignore polarity)
         return (points.first == other.points.first && points.second == other.points.second) ||
                (points.first == other.points.second && points.second == other.points.first);
     }

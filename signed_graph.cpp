@@ -14,8 +14,7 @@ std::ostream& operator<<(std::ostream& os, const Edge& e) {
 
 std::ostream& operator<<(std::ostream& os, const SignedEdge& e) {
     std::ostringstream tmp;
-    tmp.setf(std::ios::fixed); tmp<<std::setprecision(3)<<e.salience;
-    os << e.points << ": " << e.sign << " [salience=" << tmp.str() << "]";
+    os << e.points << ": " << e.sign << "]";
     return os;
 }
 
@@ -32,7 +31,7 @@ GraphCore::GraphCore(const GraphCore* const other)
 GraphCore::GraphCore(const GraphCore* const other, std::vector<double> new_weights)
     : g_(other->g_), _edge_index(other->_edge_index) {
     validate_and_fill_sigma(sigma_, new_weights);
-    rebuild_bitmaps_from_sigma_();
+    rebuild_bitmaps_from_sign_();
     compute_degrees();
 }
 
@@ -46,7 +45,7 @@ GraphCore::GraphCore(const std::shared_ptr<igraph_t> base, std::vector<double> n
         igraph_integer_t u, v; igraph_edge(g_.get(), eid, &u, &v);
         _edge_index.emplace(Edge{(int)u, (int)v}, eid);
     }
-    rebuild_bitmaps_from_sigma_();
+    rebuild_bitmaps_from_sign_();
     compute_degrees();
 }
 
@@ -88,56 +87,8 @@ GraphCore::GraphCore(const std::string& file_path)
         _edge_index.emplace(Edge{(int)u, (int)v}, eid);
     }
 
-    rebuild_bitmaps_from_sigma_();
+    rebuild_bitmaps_from_sign_();
     compute_degrees();
-}
-
-// === GraphCore bitmap hooks ===
-void GraphCore::flip_incident_edges_bitmaps_only_(int u) {
-    const size_t n = (size_t)vertex_count();
-    // Snapshot current rows
-    const auto& rowP = N_pos_[(size_t)u].w_;
-    const auto& rowN = N_neg_[(size_t)u].w_;
-    std::vector<Bitmap::word_t> P(rowP.begin(), rowP.end());
-    std::vector<Bitmap::word_t> N(rowN.begin(), rowN.end());
-
-    auto clear_bit = [](Bitmap& b, size_t idx) {
-        b.w_[idx >> 6] &= ~(Bitmap::word_t(1) << (idx & 63));
-    };
-    auto set_bit = [](Bitmap& b, size_t idx) {
-        b.w_[idx >> 6] |=  (Bitmap::word_t(1) << (idx & 63));
-    };
-
-    // For each v in old positive neighbors: move u from pos->neg in row v
-    for (size_t wi = 0, W = P.size(); wi < W; ++wi) {
-        Bitmap::word_t mask = P[wi];
-        while (mask) {
-            const int tz = __builtin_ctzll(mask);
-            const size_t v = (wi << 6) + (size_t)tz;
-            if (v < n) { clear_bit(N_pos_[v], (size_t)u); set_bit(N_neg_[v], (size_t)u); }
-            mask &= (mask - 1);
-        }
-    }
-    // For each v in old negative neighbors: move u from neg->pos in row v
-    for (size_t wi = 0, W = N.size(); wi < W; ++wi) {
-        Bitmap::word_t mask = N[wi];
-        while (mask) {
-            const int tz = __builtin_ctzll(mask);
-            const size_t v = (wi << 6) + (size_t)tz;
-            if (v < n) { clear_bit(N_neg_[v], (size_t)u); set_bit(N_pos_[v], (size_t)u); }
-            mask &= (mask - 1);
-        }
-    }
-
-    // Swap row u: pos<->neg
-    N_pos_[(size_t)u].w_ = std::move(N);
-    N_neg_[(size_t)u].w_ = std::move(P);
-}
-
-void GraphCore::rebuild_bitmaps_from_sigma_and_switching_(const std::vector<double>& s) {
-    rebuild_bitmaps_from_sigma_();
-    const int n = vertex_count();
-    for (int u = 0; u < n; ++u) if (is_neg_(s[u])) flip_incident_edges_bitmaps_only_(u);
 }
 
 // ===== SignedGraph ctors =====
@@ -145,32 +96,32 @@ SignedGraph::SignedGraph(const std::shared_ptr<igraph_t> base,
                          std::vector<double> new_sigma,
                          std::vector<double> new_s)
     : GraphCore(base, std::move(new_sigma)),
-      s_(this, new_s, /*rebuild_bitmaps=*/true) {
-    const int n = igraph_vcount(base.get());
-    if ((int)s_.size() != n) throw std::invalid_argument("Switching vector size does not match vertex count.");
-    compute_degrees();
+      s_(this) {
+	compose_switching_inplace(new_s);
 }
 
 SignedGraph::SignedGraph(const SignedGraph* const other)
     : GraphCore(static_cast<const GraphCore* const>(other)),
-      s_(this, other->s_.readonly(), /*rebuild_bitmaps=*/false) {}
+      s_(this) {
+	compose_switching_inplace(other->s_.readonly());
+}
 
 SignedGraph::SignedGraph(const SignedGraph* const other, std::vector<double> new_sigma)
     : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
-      s_(this, other->s_.readonly(), /*rebuild_bitmaps=*/true) { compute_degrees(); }
+      s_(this) {
+	compose_switching_inplace(other->s_.readonly());
+}
 
 SignedGraph::SignedGraph(const std::string& file_path)
-    : GraphCore(file_path), s_(this, vertex_count(), 1.0) {
+    : GraphCore(file_path), s_(this) {
 }
 
 SignedGraph::SignedGraph(const SignedGraph* const other,
                          std::vector<double> new_sigma,
                          std::vector<double> new_s)
     : GraphCore(other, std::move(new_sigma)),
-      s_(this, new_s, /*rebuild_bitmaps=*/true) {
-    if ((int)s_.size() != igraph_vcount(g_.get()))
-        throw std::invalid_argument("Switching vector size does not match vertex count.");
-    compute_degrees();
+      s_(this) {
+	compose_switching_inplace(new_s);
 }
 
 std::unique_ptr<SignedGraph> SignedGraph::clone() const {
@@ -178,6 +129,54 @@ std::unique_ptr<SignedGraph> SignedGraph::clone() const {
 }
 
 SignedGraph::~SignedGraph() {}
+
+// snapshot before changing s[u]
+void SignedGraph::on_switch_sign_changed_(int u, double from, double to,
+                                          igraph_vector_int_t* incident)
+{
+    // If signs did not change, nothing to do.
+    if (is_neg_(from) == is_neg_(to)) return;
+
+    const igraph_t* G = g_.get();
+    const int n = vertex_count();
+
+    igraph_vector_int_t local;
+    bool owned = false;
+    if (!incident) { igraph_vector_int_init(&local, 0); incident = &local; owned = true; }
+    if (igraph_vector_int_size(incident) == 0) {
+        igraph_incident(G, incident, u, IGRAPH_ALL);
+    }
+
+    const int deg = (int) igraph_vector_int_size(incident);
+    std::vector<int> old_sign((size_t)deg, 0);
+
+    // Snapshot signs BEFORE the flip (virtual dispatch → current effective signs)
+    for (int k = 0; k < deg; ++k) {
+        const int eid = VECTOR(*incident)[k];
+        old_sign[(size_t)k] = sign_of(eid);
+    }
+
+    // Swap degree buckets at u and swap its bitmap rows (+ ↔ −)
+    std::swap(d_pos[u], d_neg[u]);
+    Bitmap::swap(N_pos_[(size_t)u], N_neg_[(size_t)u]);
+
+    // Update neighbors' degree buckets and symmetric bits (v,u)
+    for (int k = 0; k < deg; ++k) {
+        const int eid = VECTOR(*incident)[k];
+        const int v   = IGRAPH_OTHER(G, eid, u);
+
+        d_pos[v] -= old_sign[(size_t)k]; d_neg[v] += old_sign[(size_t)k];
+        if (is_pos_(old_sign[(size_t)k])) {  // (u,v) became negative
+            N_pos_[(size_t)v].iclear((size_t)u);  // clear (v,u) from positive row
+            N_neg_[(size_t)v].iset((size_t)u);  // set   (v,u) in  negative row
+        } else {                // (u,v) became positive
+            N_neg_[(size_t)v].iclear((size_t)u);
+            N_pos_[(size_t)v].iset((size_t)u);
+        }
+    }
+
+    if (owned) igraph_vector_int_destroy(&local);
+}
 
 int SignedGraph::frustrated_edges() const {
     return negative_edge_count();
@@ -192,90 +191,12 @@ bool SignedGraph::has_fractional_switching(double eps) const {
     return false;
 }
 
-// signed_graph.cpp
 void SignedGraph::single_switching(int u, igraph_vector_int_t* incident) {
-    const igraph_t* G = g_.get();
-
-    igraph_vector_int_t local;
-    bool owned = false;
-    if (incident == nullptr) {
-        igraph_vector_int_init(&local, 0);
-        incident = &local;
-        owned = true;
-    }
-    if (igraph_vector_int_size(incident) == 0) {
-        igraph_incident(G, incident, u, IGRAPH_ALL);
-    }
-
-    const int deg = (int)igraph_vector_int_size(incident);
-    std::vector<char> was_pos(deg, 0);
-
-    // Snapshot sign BEFORE the flip
-    for (int k = 0; k < deg; ++k) {
-        const int eid = VECTOR(*incident)[k];
-        was_pos[k] = !is_neg_edge(eid);
-    }
-
-    // Flip and clamp s[u] (guard updates bitmaps)
-    s_[u] = -s_[u];
-
-    // All incident edges invert sign ⇒ swap degree buckets at u
-    std::swap(d_pos[u], d_neg[u]);
-
-    // Update neighbor degree buckets only for edges (u,v)
-    for (int k = 0; k < deg; ++k) {
-        const int eid = VECTOR(*incident)[k];
-        const int v   = IGRAPH_OTHER(G, eid, u);
-
-        if (was_pos[k]) { // became negative after flip
-            d_pos[v] -= 1.0;
-            d_neg[v] += 1.0;
-        } else {           // became positive after flip
-            d_neg[v] -= 1.0;
-            d_pos[v] += 1.0;
-        }
-    }
-
-    if (owned) {
-        igraph_vector_int_destroy(&local);
-    }
+	s_.assign_(u, -static_cast<double>(s_[u]), incident);
 }
 
 void SignedGraph::single_switching(int u) {
-    igraph_vector_int_t incident; igraph_vector_int_init(&incident, 0);
-    single_switching(u, &incident);
-    igraph_vector_int_destroy(&incident);
-}
-
-void SignedGraph::flip_and_refresh_net_degree(int u, std::vector<double>& dtilde) {
-    const igraph_t* G = g_.get();
-
-    igraph_vector_int_t inc; igraph_vector_int_init(&inc, 0);
-    igraph_incident(G, &inc, u, IGRAPH_ALL);
-
-    const int deg = (int)igraph_vector_int_size(&inc);
-    std::vector<int> nbrs; nbrs.reserve(deg);
-    std::vector<double> p0; p0.reserve(deg);
-
-    // Record pre-flip contributions p0 = s[u]*sigma_e*s[v]
-    for (int k = 0; k < deg; ++k) {
-        const int eid = VECTOR(inc)[k];
-        const int v   = IGRAPH_OTHER(G, eid, u);
-        nbrs.push_back(v);
-        p0.push_back(s_.readonly()[u] * static_cast<double>(sigma_[eid]) * s_.readonly()[v]);
-    }
-
-    // Local update on structure (degrees + bitmaps via guard inside single_switching)
-    single_switching(u, &inc);
-
-    // Update fractional net degrees locally
-    dtilde[u] = -dtilde[u];
-    for (int i = 0; i < deg; ++i) {
-        const int v = nbrs[i];
-        dtilde[v] -= 2.0 * p0[i];
-    }
-
-    igraph_vector_int_destroy(&inc);
+	single_switching(u, nullptr);
 }
 
 bool SignedGraph::are_cycles_sign_correct(const std::vector<NegativeCycle>& cycles, bool expect_negative) const {
@@ -305,13 +226,104 @@ std::vector<int> SignedGraph::maximal_salience_clique_strict_pos(const std::vect
         if (sa != sb) return sa > sb;
         return a < b;
     });
-    std::vector<int> Q; Q.reserve(cand.size());
-    Q.push_back(cand.front());
-    for (size_t i = 1; i < cand.size(); ++i) {
-        int u = cand[i]; bool ok = true;
-        for (int w : Q) { 
-            if (!is_pos_edge(u, w)) { ok = false; break; } }
-        if (ok) Q.push_back(u);
-    }
-    return Q;
+    return maximal_clique_strict_pos(cand);
 }
+
+void SignedGraph::save_partition_svg(const std::vector<int>& partition, const std::string& filename, bool custom_layout) const {
+    igraph_vector_ptr_t v_attrs;
+    igraph_vector_ptr_init(&v_attrs, 0);
+    igraph_vector_ptr_t e_attrs;
+    igraph_vector_ptr_init(&e_attrs, 0);
+
+    igraph_strvector_t colors;
+    igraph_strvector_init(&colors, 2);
+    igraph_strvector_set(&colors, 0, "red");
+    igraph_strvector_set(&colors, 1, "blue");
+
+    igraph_vector_t color_attr;
+    igraph_vector_init(&color_attr, igraph_vcount(g_.get()));
+    for (int i = 0; i < igraph_vcount(g_.get()); ++i) {
+        VECTOR(color_attr)[i] = partition[i];
+    }
+    igraph_cattribute_VAN_setv(const_cast<igraph_t*>(g_.get()), "color", &color_attr);
+    igraph_vector_destroy(&color_attr);
+
+    igraph_strvector_t ecolors;
+    igraph_strvector_init(&ecolors, igraph_ecount(g_.get()));
+
+    int i = 0;
+    for (const auto& [edge, sign] : signs_view()) {
+        bool is_frustrated = (sign == 1 && partition[edge.first] != partition[edge.second]) ||
+                             (sign == -1 && partition[edge.first] == partition[edge.second]);
+        igraph_strvector_set(&ecolors, i++, is_frustrated ? "red" : "blue");
+    }
+    igraph_cattribute_EAS_setv(const_cast<igraph_t*>(g_.get()), "color", &ecolors);
+
+    igraph_t gcopy;
+    igraph_copy(&gcopy, g_.get());
+
+    igraph_matrix_t layout;
+    if (custom_layout) {
+        igraph_matrix_init(&layout, igraph_vcount(g_.get()), 2);
+        int above = 0, below = 0;
+        for (int i2 = 0; i2 < igraph_vcount(g_.get()); ++i2) {
+            double x = (partition[i2] == 0 ? above++ : below++);
+            double y = (partition[i2] == 0 ? 1.0 : 0.0);
+            MATRIX(layout, i2, 0) = x;
+            MATRIX(layout, i2, 1) = y;
+        }
+    }
+    std::string dot_filename = filename;
+    if (dot_filename.size() > 4 && dot_filename.substr(dot_filename.size() - 4) == ".svg") {
+        dot_filename = dot_filename.substr(0, dot_filename.size() - 4) + ".dot";
+    }
+    std::cout << "[INFO] Writing graph to: " << dot_filename << std::endl;
+    std::cout << "[INFO] To convert to SVG: dot -Tsvg " << dot_filename << " -o " << dot_filename.substr(0, dot_filename.size() - 4) + ".svg" << std::endl;
+    FILE* fout = fopen(filename.c_str(), "w");
+    if (custom_layout) {
+        igraph_write_graph_dot(&gcopy, fout);
+        igraph_matrix_destroy(&layout);
+    } else {
+        igraph_write_graph_dot(&gcopy, fout);
+    }
+    fclose(fout);
+    igraph_destroy(&gcopy);
+
+    igraph_strvector_destroy(&colors);
+    igraph_strvector_destroy(&ecolors);
+    igraph_vector_ptr_destroy_all(&v_attrs);
+    igraph_vector_ptr_destroy_all(&e_attrs);
+}
+
+#if SG_DEBUG
+// --- definition for the forward-declared helper ---
+static int cc_on_strict_pos(const igraph_t* g, const std::vector<double>& switched_weights,
+                            std::vector<int>& comp_id, std::vector<int>& comp_size) {
+    const int n = igraph_vcount(g);
+    const int m = igraph_ecount(g);
+    comp_id.assign(n, -1);
+    comp_size.clear();
+    std::vector<std::vector<int>> adj(n);
+    for (int eid=0; eid<m; ++eid) {
+        if (switched_weights[eid] > 0.0) {
+            igraph_integer_t u,v; igraph_edge(g, eid, &u, &v);
+            adj[(int)u].push_back((int)v);
+            adj[(int)v].push_back((int)u);
+        }
+    }
+    int cid=0;
+    std::vector<int> st; st.reserve(n);
+    for (int s=0; s<n; ++s) if (comp_id[s] < 0) {
+        comp_size.push_back(0);
+        st.clear(); st.push_back(s);
+        comp_id[s]=cid;
+        while(!st.empty()){
+            int u=st.back(); st.pop_back();
+            ++comp_size.back();
+            for (int w: adj[u]) if (comp_id[w] < 0) { comp_id[w]=cid; st.push_back(w); }
+        }
+        ++cid;
+    }
+    return cid;
+}
+#endif

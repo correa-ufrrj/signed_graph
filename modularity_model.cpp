@@ -20,7 +20,7 @@ ModularityModel::ModularityModel(SignedGraphForMIP& g, int cut_flags)
         m_minus /= 2.0;
 
         std::vector<double> weights(g.edge_count());
-        for (const auto& [edge, sign, _] : g.signs_view()) {
+        for (const auto& [edge, sign] : g.signs_view()) {
             int u = edge.first;
             int v = edge.second;
 
