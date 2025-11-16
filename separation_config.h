@@ -19,7 +19,7 @@ struct SeparationConfig {
 
     // ------------------------- Weight dynamics -------------------------
     struct Weights {
-        double beta_emit = 0.8;    // within-batch ω′ bump per emit (used_density-scaled)
+        double beta_emit = 10;    // within-batch ω′ bump per emit (used_density-scaled)
         double beta_sel  = 0.2;    // cross-batch ω  drift per accepted edge
         double omega_eps = 1e-6;    // lower clamp for ω, ω′
         double omega_max = 32.0;    // upper clamp for ω
@@ -28,11 +28,11 @@ struct SeparationConfig {
     // -------------------------- Budgets / caps -------------------------
     struct Budgets {
         // Triangles (TBB)
-        int B_tri            = 512;  // global per-batch budget
+        int B_tri            = 1024;  // global per-batch budget
         int K_tri_per_neg    = 1;   // per-bucket prefilter
         int tri_cap_per_vertex = 1; // per-vertex cap during selection
         // Shortest-path cycles (NCB)
-        int B_sp             = 512;  // cycles budget (if used by driver)
+        int B_sp             = 1024;  // cycles budget (if used by driver)
         int K_sp_per_neg     = 1;   // alt paths per negative anchor
         int sp_cap_per_vertex= 6;   // per-vertex cap for SP acceptance
     } budget;

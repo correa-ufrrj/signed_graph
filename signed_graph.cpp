@@ -24,6 +24,7 @@ GraphCore::GraphCore(const GraphCore* const other)
       sigma_(other->sigma_),
       d_pos(other->d_pos),
       d_neg(other->d_neg),
+      m_pos(other->m_pos),m_neg(other->m_neg),
       _edge_index(other->_edge_index),
       N_pos_(other->N_pos_),
       N_neg_(other->N_neg_) {}
@@ -91,37 +92,94 @@ GraphCore::GraphCore(const std::string& file_path)
     compute_degrees();
 }
 
+std::vector<GraphCore::Bitmap> GraphCore::connected_components(int sign) const {
+    const int n = vertex_count();
+
+    // visited bitmap over all vertices
+    Bitmap visited = make_empty_bitmap((size_t)n);
+
+    std::vector<Bitmap> components;
+    components.reserve(4); // heuristic reserve
+
+    // Start a new component at s
+    Bitmap q = make_empty_bitmap((size_t)n);
+
+    for (int s = 0; s < n; ++s) {
+        if (visited.contains((size_t)s)) continue;
+
+        // Start a new component at s
+        Bitmap comp = make_empty_bitmap((size_t)n);
+
+        visited.iset((size_t)s);
+        comp.iset((size_t)s);
+        q.iset((size_t)s);
+
+        while (!q.empty()) {
+            const int u = q.pop_front();
+            
+			// inside the BFS loop
+			const Bitmap& Nb = neighbors_bm((size_t)u, sign);
+			Bitmap add = Nb;         // copy
+			add.isub(visited);       // keep only *new* vertices
+			visited.ior(add);        // mark them visited
+			comp.ior(add);           // add to current component
+			q.ior(add);              // enqueue them
+        }
+
+        components.emplace_back(std::move(comp));
+    }
+
+    return components;
+}
+
 // ===== SignedGraph ctors =====
+
+// Build from an existing igraph + new σ and a switching vector new_s.
+// GraphCore(base, new_sigma) builds bitmaps for raw σ → we must apply switching.
 SignedGraph::SignedGraph(const std::shared_ptr<igraph_t> base,
                          std::vector<double> new_sigma,
                          std::vector<double> new_s)
     : GraphCore(base, std::move(new_sigma)),
-      s_(this) {
-	compose_switching_inplace(new_s);
+      s_(this)
+{
+    compose_switching_inplace(new_s);   // flips bitmaps/degree buckets to match new_s
 }
 
+// Pointer-copy from another SignedGraph.
+// GraphCore(other) copies already-switched bitmaps/degree buckets → do NOT flip again.
 SignedGraph::SignedGraph(const SignedGraph* const other)
     : GraphCore(static_cast<const GraphCore* const>(other)),
-      s_(this) {
-	compose_switching_inplace(other->s_.readonly());
+      s_(this)
+{
+    s_.vals_ = other->s_.readonly();    // silent copy; no structural updates
 }
 
+// Replace σ, keep other's switching.
+// GraphCore(other, new_sigma) is raw σ → we must apply other's s to rebuild effective signs.
 SignedGraph::SignedGraph(const SignedGraph* const other, std::vector<double> new_sigma)
     : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
-      s_(this) {
-	compose_switching_inplace(other->s_.readonly());
+      s_(this)
+{
+    compose_switching_inplace(other->s_.readonly());  // bring structure in sync with s_copy
 }
 
+// Load from file: σ-only; s_ defaults to +1, which already matches the structure.
 SignedGraph::SignedGraph(const std::string& file_path)
-    : GraphCore(file_path), s_(this) {
+    : GraphCore(file_path),
+      s_(this)
+{
+    // nothing else to do
 }
 
+// Replace σ and s explicitly.
+// GraphCore(other, new_sigma) is raw σ → apply new_s to structure.
 SignedGraph::SignedGraph(const SignedGraph* const other,
                          std::vector<double> new_sigma,
                          std::vector<double> new_s)
-    : GraphCore(other, std::move(new_sigma)),
-      s_(this) {
-	compose_switching_inplace(new_s);
+    : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
+      s_(this)
+{
+    compose_switching_inplace(new_s);
 }
 
 std::unique_ptr<SignedGraph> SignedGraph::clone() const {
@@ -130,60 +188,88 @@ std::unique_ptr<SignedGraph> SignedGraph::clone() const {
 
 SignedGraph::~SignedGraph() {}
 
-// snapshot before changing s[u]
-void SignedGraph::on_switch_sign_changed_(int u, double from, double to,
-                                          igraph_vector_int_t* incident)
-{
-    // If signs did not change, nothing to do.
-    if (is_neg_(from) == is_neg_(to)) return;
+void GraphCore::on_neg_flip_batch_(const GraphCore::Bitmap& anchor) {
+    // C̄ = V \ A
+    GraphCore::Bitmap comp = anchor.complement();
 
-    const igraph_t* G = g_.get();
-    const int n = vertex_count();
+    size_t moved_total = 0; // number of edges moved from N⁻ to N⁺ (counted once)
 
-    igraph_vector_int_t local;
-    bool owned = false;
-    if (!incident) { igraph_vector_int_init(&local, 0); incident = &local; owned = true; }
-    if (igraph_vector_int_size(incident) == 0) {
-        igraph_incident(G, incident, u, IGRAPH_ALL);
+    // For each vertex v in the complement, convert all N⁻(v) ∩ A to positive
+    for (size_t vs : comp) {
+        const int v = static_cast<int>(vs);
+
+        // av = set of anchor endpoints u with (u,v) currently negative
+        GraphCore::Bitmap av = neighbors_bm((size_t)v, -1); // copy
+        av.iand(anchor);
+
+        const size_t k = av.count();
+        if (k == 0) continue;
+        moved_total += k;
+
+        // Move those edges for v in one shot: N⁻(v) -= av, N⁺(v) |= av
+        N_neg_[(size_t)v].isub(av);
+        N_pos_[(size_t)v].ior(av);
+
+        // Update degree buckets for v
+        d_neg[v] -= static_cast<int>(k);
+        d_pos[v] += static_cast<int>(k);
+
+        for (size_t us : av) {
+            const int u = static_cast<int>(us);
+
+            // Move v within u's adjacency bitmaps (single-bit ops)
+            N_neg_[(size_t)u].iclear((size_t)v);
+            N_pos_[(size_t)u].iset  ((size_t)v);
+
+            // Update degrees for u
+            d_neg[u] -= 1;
+            d_pos[u] += 1;
+        }
     }
 
-    const int deg = (int) igraph_vector_int_size(incident);
-    std::vector<int> old_sign((size_t)deg, 0);
+    // Update global edge counters once (each crossing edge counted exactly once)
+    m_neg -= static_cast<int>(moved_total);
+    m_pos += static_cast<int>(moved_total);
+}
 
-    // Snapshot signs BEFORE the flip (virtual dispatch → current effective signs)
-    for (int k = 0; k < deg; ++k) {
-        const int eid = VECTOR(*incident)[k];
-        old_sign[(size_t)k] = sign_of(eid);
+// snapshot before changing s[u]
+void GraphCore::on_vertex_flip_(int u)
+{
+	for (int v : neighbors_bm(u)) {
+		int old_sign = sign_of(u,v);
+	    d_pos[v] -= old_sign; d_neg[v] += old_sign;
+	    if (is_pos_(old_sign)) {
+	        N_pos_[(size_t)v].iclear((size_t)u);  // clear (v,u) from positive row
+	        m_pos--;
+	        N_neg_[(size_t)v].iset((size_t)u);  // set   (v,u) in  negative row
+	        m_neg++;
+	    } else {
+	        N_neg_[(size_t)v].iclear((size_t)u);
+	        m_neg--;
+	        N_pos_[(size_t)v].iset((size_t)u);
+	        m_pos++;
+	    }
     }
 
     // Swap degree buckets at u and swap its bitmap rows (+ ↔ −)
     std::swap(d_pos[u], d_neg[u]);
     Bitmap::swap(N_pos_[(size_t)u], N_neg_[(size_t)u]);
+}
 
-    // Update neighbors' degree buckets and symmetric bits (v,u)
-    for (int k = 0; k < deg; ++k) {
-        const int eid = VECTOR(*incident)[k];
-        const int v   = IGRAPH_OTHER(G, eid, u);
-
-        d_pos[v] -= old_sign[(size_t)k]; d_neg[v] += old_sign[(size_t)k];
-        if (is_pos_(old_sign[(size_t)k])) {  // (u,v) became negative
-            N_pos_[(size_t)v].iclear((size_t)u);  // clear (v,u) from positive row
-            N_neg_[(size_t)v].iset((size_t)u);  // set   (v,u) in  negative row
-        } else {                // (u,v) became positive
-            N_neg_[(size_t)v].iclear((size_t)u);
-            N_pos_[(size_t)v].iset((size_t)u);
-        }
-    }
-
-    if (owned) igraph_vector_int_destroy(&local);
+// snapshot before changing s[u]
+void SignedGraph::on_vertex_flip_(int u, double from, double to)
+{
+    // If signs did not change, nothing to do.
+    if (is_neg_(from) == is_neg_(to)) return;
+	GraphCore::on_vertex_flip_(u);
 }
 
 int SignedGraph::frustrated_edges() const {
-    return negative_edge_count();
+    return edge_count(-1);
 }
 
 const std::vector<Edge> SignedGraph::frustrated_edges_keys() const {
-    return get_negative_edges();
+    return get_edges(-1);
 }
 
 bool SignedGraph::has_fractional_switching(double eps) const {
@@ -191,12 +277,9 @@ bool SignedGraph::has_fractional_switching(double eps) const {
     return false;
 }
 
-void SignedGraph::single_switching(int u, igraph_vector_int_t* incident) {
-	s_.assign_(u, -static_cast<double>(s_[u]), incident);
-}
-
 void SignedGraph::single_switching(int u) {
-	single_switching(u, nullptr);
+//	single_switching(u, nullptr);
+	s_[u] = -s_[u];
 }
 
 bool SignedGraph::are_cycles_sign_correct(const std::vector<NegativeCycle>& cycles, bool expect_negative) const {

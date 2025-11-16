@@ -533,7 +533,7 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
 
     // --------- NEW: build anchors & per-anchor intersections as bitmaps ----------
     // Raw negative edges under current switching (edges, not eids)
-    const auto neg_edges_raw = G_.get_negative_edges();
+    const auto neg_edges_raw = G_.get_edges(-1);
 
     // Gather saliences per full-eid to gate anchors
     std::vector<double> neg_sals;
@@ -548,8 +548,8 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
     for (double s : neg_sals) mean += s;
     mean = (neg_raw ? mean / neg_raw : 0.0);
 
-    const double p70 = percentile_of(neg_sals, 0.70);
-    const double sal_min_fallback = std::max(p70, 0.5 * mean);
+    const double p90 = percentile_of(neg_sals, 0.50);
+    const double sal_min_fallback = std::max(p90, mean);
 
     std::vector<Edge> neg_edges;
     neg_edges.reserve(neg_edges_raw.size());
@@ -563,14 +563,14 @@ void TriangleCyclePipeline::triangle_stage_(const SignedGraphForMIP& G_) {
 
         neg_edges.emplace_back(e);
         // Precompute W = N⁺(u) ∩ N⁺(v) as a bitmap (fast later enumeration)
-        pos_adj.emplace_back(G_.common_pos_neighbors(e));
+        pos_adj.emplace_back(G_.common_neighbors(e, +1));
         ++nsel;
     }
 
     std::cout << "[TBB-FILTER] negE_raw=" << neg_raw
               << " negE_keep=" << nsel
               << " sal_fallback=" << sal_min_fallback
-              << " (p70=" << p70 << ", mean=" << mean << ")\n";
+              << " (p90=" << p90 << ", mean=" << mean << ")\n";
 
     // Params from config (respect defaults)
     TriangleBucketBatch::Params P = C_.to_tbb_params();
@@ -768,30 +768,33 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
     // Build uncovered negatives = graph negatives \ covered_neg_eids_
     const auto edge_idx = G_.edge_index();
     std::unordered_set<int> covered_set(covered_neg_eids_.begin(), covered_neg_eids_.end());
-    
-	auto neg_eids_all = G_.get_negative_eids();
+
+	auto neg_eids_all = G_.get_edge_eids(-1);
 	std::vector<double> neg_sals;
-	neg_sals.reserve(neg_eids_all.size());
+	const int neg_raw = G_.edge_count(-1);
+	std::cout << "--------------------------------------------- neg_raw=" << neg_raw << "\n";
+	neg_sals.reserve(neg_raw);
 	double mean = 0.0;
 	double max = 0.0, min = 1.0;
-	for (int feid : neg_eids_all) {
+	for (int eid = 0; eid < neg_raw; eid++) {
+		const int feid = static_cast<int>(VECTOR(neg_eids_all)[eid]);
 		double s = round_.sal_full[feid];
 		neg_sals.push_back(s);
 		mean += s;
 		if (s > max) max = s;
 		if (s < min) min = s;
 	}
-	const int neg_raw = (int)neg_sals.size();
 	mean = (neg_raw ? mean / neg_raw : 0.0);
 	
-	const double p70 = percentile_of(neg_sals, 0.7);
-	const double sal_min_fallback = std::max(p70, 0.5 * mean);
+	const double p90 = percentile_of(neg_sals, 0.5);
+	const double sal_min_fallback = std::max(p90, mean);
 	
 	// Build uncovered list:
-	std::vector<Edge> neg_uncov; neg_uncov.reserve(neg_eids_all.size());
+	std::vector<Edge> neg_uncov; neg_uncov.reserve(neg_raw);
 	const auto& sv = G_.signs_view();
 	int kept = 0;
-	for (int feid : neg_eids_all) {
+	for (int eid = 0; eid < neg_raw; eid++) {
+		const int feid = static_cast<int>(VECTOR(neg_eids_all)[eid]);
 	    if (covered_set.count(feid)) continue;
 	    if (round_.sal_full[feid] < sal_min_fallback - 1e-07) continue;
 	    const auto& p = sv[feid].points;
@@ -807,7 +810,7 @@ void TriangleCyclePipeline::sp_stage_(const SignedGraphForMIP& G_) {
 	          << " kept_for_sp=" << kept
 	          << " sal_min=" << sal_min_fallback
 	          << " keep_rate=" << std::fixed << std::setprecision(2) << (100.0 * (kept / denom))
-	          << "% (min=" << min << ", max=" << max << ", p70=" << p70 << ", mean=" << mean << ")\n";
+	          << "% (min=" << min << ", max=" << max << ", p90=" << p90 << ", mean=" << mean << ")\n";
     if (kept == 0) { std::cout << "[SP-GATE] kept_for_sp=0 → skipping SP stage.\n"; return; }
 
     NegativeCycleBatch ncb(G_, neg_uncov, C_.to_ncb_params());

@@ -9,17 +9,14 @@
 #include <memory>
 #include <utility>
 #include "cycle_key.h"
-#include "reheat_pool.h"
 #include "separation_config.h"
 #include "separation_pipeline.h"
+#include <chrono>
+#include <limits>
+#include <cmath>
 
 // ----------------------------------------------------------------------------
 // FrustrationModelXY — API
-// ----------------------------------------------------------------------------
-// - Owns separation persistent state (ω, H, pool_count, de-dup sets, reheat pool)
-// - Hosts a TriangleCyclePipeline driver (round orchestrator)
-// - Exposes a single pipeline user-cut callback (triangle→SP→commit)
-// - Provides utilities to translate accepted CycleKeys → CPLEX cuts
 // ----------------------------------------------------------------------------
 class FrustrationModelXY : public FrustrationModel {
 public:
@@ -31,10 +28,8 @@ public:
     void export_solution(const std::string& file_prefix, bool with_svg) const;
 
     // ----------------------------- Separation API ----------------------------
-    // Configure the separation knobs (copied into the driver at creation time).
     void configure_separation(const SeparationConfig& cfg);
 
-    // Access the current configuration/persistent state used by the driver.
     const SeparationConfig&      separation_config()   const { return sep_cfg_; }
     SeparationConfig&            separation_config()         { return sep_cfg_; }
     const SeparationPersistent&  separation_state()    const { return sep_state_; }
@@ -49,37 +44,35 @@ public:
     bool fractional_phase_enabled() const { return fractional_phase_enabled_; }
 
     // Helper to extract current LP solution to plain vectors
-	void snapshot_lp_solution(const LpAccessor& acc) const;
+    void snapshot_lp_solution(const LpAccessor& acc) const;
 
-    // Clear & reinit the persistent separation state (ω←1, H←0, pool_count←0, de-dup cleared).
+    // Clear & reinit persistent separation state
     void reset_separation_state();
 
-    // Materialize a set of cycle keys into CPLEX cuts (standard inequality family).
-    // The returned vector carries (IloRange, debug_label) pairs.
+    // Materialize CycleKeys → CPLEX cuts (standard inequality family).
     std::vector<std::pair<IloRange, std::string>>
     build_cycle_cuts_from_keys(IloEnv& env,
                                const std::vector<fmkey::CycleKey>& keys) const;
 
-    // Lightweight stats/telemetry for debugging the separation driver.
     void print_separation_stats(std::ostream& os) const;
 
 private:
     // ========================== Variables & bookkeeping ======================
     IloNumVarArray x;   // vertex binaries
     IloNumVarArray y;   // edge binaries (undirected)
-    
-    mutable IloNumArray    		xval;
+
+    mutable IloNumArray        xval;
     mutable std::vector<double> xhat;
-    
-	int    sym_vstar = -1;
-	double sym_xfix  = 0.0;
+
+    int    sym_vstar = -1;
+    double sym_xfix  = 0.0;
 
     // Global policy for callback: Fractional vs Build phase
     bool fractional_phase_enabled_ = true;
 
-    // ===== Step 6 persistent updates (ω, H, pool_count) live here =====
-    SeparationConfig      sep_cfg_{};    // knobs (LP guidance/annealing also live here)
-    SeparationPersistent  sep_state_{};  // ω, H, pool_count, de-dup sets and reheat pool (mirrored)
+    // ===== persistent separation state (ω, H, pool_count) =====
+    SeparationConfig      sep_cfg_{};
+    SeparationPersistent  sep_state_{};
 
     // Triangle/Cycle pipeline driver (created on demand)
     std::unique_ptr<TriangleCyclePipeline> driver_;
@@ -88,11 +81,11 @@ private:
     void ensure_driver_();
 
     // ============================ Cut builders ===============================
-    std::vector<std::pair<IloRange, std::string>> generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const override;
+    std::vector<std::pair<IloRange, std::string>>
+    generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& all_edges) const override;
 
 public:
     // ============================== Callbacks ================================
-    // Full pipeline driver callback (triangle→SP→commit)
     class TriangleCycleCutGenerator : public IloCplex::UserCutCallbackI {
     public:
         FrustrationModelXY& owner;

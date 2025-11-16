@@ -10,14 +10,7 @@ ModularityModel::ModularityModel(SignedGraphForMIP& g, int cut_flags)
     : FrustrationModelXY(*(new SignedGraphForMIP(&g, [&]() {
         std::cerr << "[ModularityModel] Computing modularity weights..." << std::endl;
 
-        const auto& d_plus = g.get_pos_degrees();
-        const auto& d_minus = g.get_neg_degrees();
-
-        double m_plus = 0.0, m_minus = 0.0;
-        for (int d : d_plus) m_plus += d;
-        for (int d : d_minus) m_minus += d;
-        m_plus /= 2.0;
-        m_minus /= 2.0;
+        double m_plus = g.edge_count(+1), m_minus = g.edge_count(-1);
 
         std::vector<double> weights(g.edge_count());
         for (const auto& [edge, sign] : g.signs_view()) {
@@ -26,12 +19,12 @@ ModularityModel::ModularityModel(SignedGraphForMIP& g, int cut_flags)
 
             double w = 0.0;
             if (sign > 0) {
-                double term1 = (d_plus[u] * d_plus[v]) / (2.0 * m_plus);
-                double term2 = (d_minus[u] * d_minus[v]) / (2.0 * m_minus);
+                double term1 = (graph.degree(u, +1) * graph.degree(v, +1)) / (2.0 * m_plus);
+                double term2 = (graph.degree(u, -1) * graph.degree(v, -1)) / (2.0 * m_minus);
                 w = 1.0 - term1 + term2;
             } else {
-                double term1 = (d_minus[u] * d_minus[v]) / (2.0 * m_minus);
-                double term2 = (d_plus[u] * d_plus[v]) / (2.0 * m_plus);
+                double term1 = (graph.degree(u, -1) * graph.degree(v, -1)) / (2.0 * m_minus);
+                double term2 = (graph.degree(u, +1) * graph.degree(v, +1)) / (2.0 * m_plus);
                 w = - 1.0 - term1 + term2;
             }
 

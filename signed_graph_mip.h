@@ -4,8 +4,10 @@
 #include "signed_graph.h"
 #include <vector>
 #include <optional>
+#include <cassert>
 
 // Forward-declare the stream class
+class ShortestPathGraph;
 class NegativeCycleBatch;
 
 // Mutable MIP layer over SignedGraph.
@@ -31,40 +33,50 @@ private:
 
 	// Helper: compute x = (s + 1)/2
     inline double x_from_s_(double s) const { return (s + 1.0) / 2.0; }
+    
+	// Rebuild d̃⁺/d̃⁻ from scratch (linear in |E|).
+	// d̃⁺[u] = Σ_v max(0, p_uv), d̃⁻[u] = Σ_v max(0, −p_uv), p_uv = s[u]·σ_uv·s[v] ∈ [−1,1].
+	inline void recompute_polarity_degrees_() {
+	    const int n = vertex_count();
+	    const int m = edge_count();
+	    dtilde_pos_.assign(n, 0.0);
+	    dtilde_neg_.assign(n, 0.0);
+	
+	    for (int eid = 0; eid < m; ++eid) {
+	        igraph_integer_t u, v; igraph_edge(g_.get(), eid, &u, &v);
+	        const double p = polarity_of((int)u, (int)v, eid);  // uses s_ and GraphCore::sign_of
+	        const double pp = (p >= 0.0 ?  p : 0.0);
+	        const double pn = (p <= 0.0 ? -p : 0.0);
+	        dtilde_pos_[(int)u] += pp; dtilde_pos_[(int)v] += pp;
+	        dtilde_neg_[(int)u] += pn; dtilde_neg_[(int)v] += pn;
+	    }
+	}
 
 	// polarity_if(u,v,su): counterfactual polarity for edge (u,v)
 	// if s[u] were su, keeping s[v] fixed. Uses raw σ via GraphCore::sign_of.
-    inline double polarity_if(int u, int v, double su) const {
-        return su * GraphCore::sign_of(u, v) * s_[v];
-    }
-    inline double polarity_if(int u, int v, int eid, double su) const {
+    inline double polarity_if(const int u, const int v, double su) const {
+//		igraph_integer_t eid; igraph_get_eid(g_.get(), &eid, u, v, 0, 0);
+		int eid = _edge_index.at(Edge{u,v});
         return su * GraphCore::sign_of(u, v, eid) * s_[v];
     }
-    inline double polarity_of(int u, int v, int eid) const {
-        return s_[u] * GraphCore::sign_of(u, v, eid) * s_[v];
+    inline double polarity_if(const int u, const int v, int eid, double su) const {
+        return su * GraphCore::sign_of(u, v, eid) * s_[v];
+    }
+    inline double polarity_of(const int u, const int v, int eid) const {
+        return polarity_if(u, v, eid, s_[u]);
+    }
+    inline double polarity_of(const int u, const int v) const {
+        return polarity_if(u, v, s_[u]);
     }
     inline double polarity_of(const Edge& e) const {
         return polarity_if(e.first, e.second, s_[e.first]);
     }
-	void on_switch_sign_changed_(int u, double from, double to, igraph_vector_int_t* incident) override;
+    size_t count_crossing_neg_edges_(const GraphCore::Bitmap& anchor) const;
+	void on_vertex_flip_(int u, double from, double to) override;
+	void on_neg_flip_batch_(const GraphCore::Bitmap& anchor) override;
 
 public:
     using SignedGraph::compose_switching_inplace;
-
-    struct GreedyKickOptions {
-        int    neg_edge_threshold_abs = -1;
-        double neg_edge_threshold_frac = -1;
-        int    max_kicks = 0;
-        bool   use_weighted_degree = true;
-        bool   use_triangle_tiebreak = false;
-        double triangle_beta = 0.05;
-        int    neighbor_cap = 1024;
-        int    triangle_cap_per_u = 2048;
-        bool   relax_to_all_pos_if_Z0_empty = true;
-        int    delta_m_minus_cap = 512;
-        double delta_m_minus_penalty = 0.0;
-        int R_max = 1; int Delta = 0;
-    };
 
     // Read-only live view of fractional edge polarities p_{uv} = s[u] * sigma[uv] * s[v] ∈ [-1,1]
     class EdgePolarityView {
@@ -109,6 +121,10 @@ public:
                       const std::vector<double>& xhat);
     ~SignedGraphForMIP();
 
+	inline double pos_cum_polarity(int u) const { return dtilde_pos_[u]; }
+	inline double neg_cum_polarity(int u) const { return dtilde_neg_[u]; }
+	inline double net_polarity(int u) const { return dtilde_pos_[u] - dtilde_neg_[u]; }
+
     // Integer projection on s (round to ±1). Returns a new MIP graph.
     void apply_integer_projection();
     SignedGraphForMIP integer_projection() const;
@@ -117,8 +133,7 @@ public:
     void align_switching(int u, double xu);
 
     // Greedy switching interfaces (return-by-value); this instance remains mutable too.
-    void apply_greedy_switching(const GreedyKickOptions& opts);
-    SignedGraphForMIP greedy_switching(const GreedyKickOptions& opts) const;
+    void apply_greedy_switching();
     SignedGraphForMIP greedy_switching() const;
 
     // Rebuild current switching from a new x̂ (overwrites current s_; sigma unchanged)
@@ -143,7 +158,196 @@ public:
     // Edge polarity helpers (read-only live view and eager snapshot)
     inline EdgePolarityView edge_polarities_view() const { return EdgePolarityView(this, g_.get()); }
     const std::vector<double> edge_polarities() const;
+    
+    ShortestPathGraph shortest_path_graph() const;
 
     // Stream factory
     NegativeCycleBatch open_negative_cycle_stream() const;
+};
+
+class ShortestPathGraph final {
+public:
+    struct Path {
+    private:
+        std::vector<int>   nodes_;      // endpoints are nodes_.front(), nodes_.back()
+        std::vector<int>   pos_peids_;  // edge ids in the POS graph
+        double             cost_ = 0.0; // sum of working weights
+        bool               reachable_ = false;
+
+        friend class ShortestPathGraph;
+    public:
+        // light, read-only view
+        inline const std::vector<int>&  nodes()     const { return nodes_; }
+        inline std::vector<Edge> 		edges()		const {
+			std::vector<Edge> edges_; edges_.reserve(std::max(0, length() - 1)); 
+	        const auto& ns = nodes_;
+	        for (int i = 1; i < (int)ns.size(); ++i){
+	            edges_.emplace_back(ns[i-1], ns[i]);
+	        }
+	        return edges_;
+	    }
+        inline double                   cost()      const { return cost_; }
+        inline bool                     reachable() const { return reachable_; }
+        inline int                      length()    const { return (int)nodes_.size(); }
+    };
+
+    // Creation — by value from the owner (only stores a reference to owner).
+    explicit ShortestPathGraph(const SignedGraphForMIP& owner,
+                            double eps = 1e-12, double max_cap = 0.0)
+        : G_(owner), w_eps(eps), w_cap(max_cap) {
+        // Silence igraph "Couldn't reach some vertices" warnings just for this batch.
+        struct IgraphWarningSilencer {
+            igraph_warning_handler_t* prev = nullptr;
+            static void noop(const char*, const char*, int) {}
+            IgraphWarningSilencer() : prev(igraph_set_warning_handler(noop)) {}
+            ~IgraphWarningSilencer() { igraph_set_warning_handler(prev); }
+        } _silence_igraph_warnings_guard;
+		igraph_vector_int_init(&sp_nodes_, 0);
+		sp_nodes_init_ = true;
+    }
+
+    ~ShortestPathGraph() {
+        if (built_) igraph_destroy(&g_pos_);
+        if (w_pos_init_) igraph_vector_destroy(&w_pos_);
+        if (sp_nodes_init_) igraph_vector_int_destroy(&sp_nodes_);
+    }
+    ShortestPathGraph(const ShortestPathGraph&) = delete;
+    ShortestPathGraph& operator=(const ShortestPathGraph&) = delete;
+    // Custom move to avoid double-free of igraph objects
+    ShortestPathGraph(ShortestPathGraph&& other) noexcept
+        : G_(other.G_)
+        , g_pos_(other.g_pos_)
+        , built_(other.built_)
+        , w_pos_(other.w_pos_)
+        , w_pos_init_(other.w_pos_init_)
+        , sp_nodes_(other.sp_nodes_)
+        , sp_nodes_init_(other.sp_nodes_init_)
+        , w_eps(other.w_eps)
+        , w_cap(other.w_cap)
+        , full2pos_eid_(std::move(other.full2pos_eid_))
+        , pos2full_eid_(std::move(other.pos2full_eid_)) {
+        other.built_ = false;
+        other.w_pos_init_ = false;
+        other.sp_nodes_init_ = false;
+        // leave other's PODs in a safe-to-destroy state
+    }
+    ShortestPathGraph& operator=(ShortestPathGraph&& other) noexcept {
+        if (this == &other) return *this;
+        if (built_)          igraph_destroy(&g_pos_);
+        if (w_pos_init_)     igraph_vector_destroy(&w_pos_);
+        if (sp_nodes_init_)  igraph_vector_int_destroy(&sp_nodes_);
+        // move-transfer
+        g_pos_ = other.g_pos_; built_ = other.built_;
+        w_pos_ = other.w_pos_; w_pos_init_ = other.w_pos_init_;
+        sp_nodes_ = other.sp_nodes_; sp_nodes_init_ = other.sp_nodes_init_;
+        w_eps = other.w_eps; w_cap = other.w_cap;
+        full2pos_eid_ = std::move(other.full2pos_eid_);
+        pos2full_eid_ = std::move(other.pos2full_eid_);
+        // null out source
+        other.built_ = false;
+        other.w_pos_init_ = false;
+        other.sp_nodes_init_ = false;
+        return *this;
+    }
+    // Rebuild internal POS graph + maps after a switching in the owner.
+    inline void notify_signs_changed() { build_graph_(); }
+
+    // ===== Weights (endpoint-based) =====
+    // NOTE: Per request, no guards: callers must ensure (u,v) is a POS edge.
+    inline double weight(int u, int v) const {
+        // Map (u,v) → full_eid via owner's edge index
+        const int full_eid = G_.edge_index(u, v);             // -1 if absent
+
+        // Map full_eid → pos_eid; negative edges have -1
+        const igraph_integer_t peid = full2pos_eid_[(size_t)full_eid];
+
+        // Pull the current working weight (Dijkstra weights vector)
+        return weight(peid);
+    }
+    inline void set_weight(int u, int v, double w) {
+        const int fe = G_.edge_index(u, v);
+        const int pe = full2pos_eid_[(size_t)fe];
+        set_weight(pe, w);
+    }
+    // Bump with clamps (eps, max_cap=0 → no cap)
+    inline void bump_weight(int u, int v, double delta) {
+        const int fe = G_.edge_index(u, v);
+        const int pe = full2pos_eid_[(size_t)fe];
+        double w = weight(pe) + delta;
+        if (w < w_eps) w = w_eps;
+        if (w_cap > 0.0 && w > w_cap) w = w_cap;
+        set_weight(pe, w);
+    }
+    // Bump with clamps (eps, max_cap=0 → no cap)
+    inline void bump_weights(const Path& p, double delta) {
+        for (int pe : p.pos_peids_) {
+	        double w = weight(pe) + delta;
+	        if (w < w_eps) w = w_eps;
+	        if (w_cap > 0.0 && w > w_cap) w = w_cap;
+	        set_weight(pe, w);
+        }
+    }
+
+    // Reseed from a FULL-edge “base” vector (size == |E_full|); only POS edges are read.
+    void reseed_weights(const std::vector<double>& base) {
+        const long mpos = (long)pos2full_eid_.size();
+        assert((long)base.size() >= (long)full2pos_eid_.size());
+        for (long pe = 0; pe < mpos; ++pe) {
+            const int fe = pos2full_eid_[pe];
+            double w = base[(size_t)fe];
+            set_weight(pe, w);
+        }
+    }
+
+    // ===== Shortest paths =====
+    // Dijkstra(s,t) using current working weights; returns Path with nodes, pos_peids, cost, reachable.
+    Path dijkstra(int s, int t) const;
+
+    // Visit edges on a Path by endpoints (delegates topology; caller never sees maps).
+    template <class F>
+    void for_each_edge(const Path& p, F&& f) const {
+        const auto& ns = p.nodes_;
+        for (int i = 1; i < (int)ns.size(); ++i) f(ns[i-1], ns[i]);
+    }
+
+    // visit full-eids on a Path (mapping hidden; caller gets IDs only).
+    template <class F>
+    void for_each_eid(const Path& p, F&& f) const {
+        for (int pe : p.pos_peids_) f(pos2full_eid_[(size_t)pe]);
+    }
+
+    // visit full-eids on a Path (mapping hidden; caller gets IDs only).
+    template <class F>
+    void for_each_weight(const Path& p, F&& f) const {
+        for (int pe : p.pos_peids_) f(weight(pe));
+    }
+
+private:
+    const SignedGraphForMIP& G_;
+
+    // POS-only graph + working weights
+    igraph_t        g_pos_{};
+    bool            built_{false};
+    igraph_vector_t w_pos_{};
+    bool            w_pos_init_{false};
+    mutable bool    sp_nodes_init_{false};
+    
+    double w_eps{1e-12};
+    double w_cap{0.0};
+
+    // FULL↔POS maps (internal)
+    std::vector<int> full2pos_eid_; // size |E_full| ; -1 for non-POS
+    std::vector<int> pos2full_eid_; // size |E_pos|
+    
+    // to reuse in dijkstra (mutable: written in const dijkstra())
+    mutable igraph_vector_int_t sp_nodes_;
+
+    inline double weight(const int peid) const {
+        // Pull the current working weight (Dijkstra weights vector)
+        return (double)VECTOR(w_pos_)[peid];
+    }
+    inline void set_weight(const int peid, double w) {
+        VECTOR(w_pos_)[peid] = w;
+    }
+    void build_graph_();
 };

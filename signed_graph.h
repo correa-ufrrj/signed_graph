@@ -1,6 +1,7 @@
 // signed_graph.h
 #pragma once
 
+
 #define IGRAPH_ENABLE_LGPL
 #include <igraph/igraph.h>
 #include <igraph/igraph_vector.h>
@@ -27,9 +28,11 @@
 #include <vector>
 #include <iterator>
 
+
 struct IGraphDeleter {
   void operator()(igraph_t* p) const noexcept { if (p) { igraph_destroy(p); delete p; } }
 };
+
 
 // Sign convention (immutable base):
 //  - sigma_[eid] ∈ {−1, +1} is the raw, unswitched sign of edge eid.
@@ -44,6 +47,7 @@ public:
         using word_t = uint64_t;
         static constexpr size_t kWordBits = 64;
 
+
         // ---- queries ----
         inline size_t extent()  const { return nbits_; }
         inline bool   empty() const {
@@ -53,6 +57,19 @@ public:
         inline bool contains(size_t i) const {
             return (w_[i >> 6] >> (i & 63)) & 1ULL;
         }
+		// Removes and returns the smallest element (index) in the set.
+		// Precondition: !empty(); returns -1 only if called on an empty bitmap.
+		inline int pop_front() {
+		    for (size_t wi = 0, n = w_.size(); wi < n; ++wi) {
+		        word_t word = w_[wi];
+		        if (word) {
+		            const unsigned tz = (unsigned)__builtin_ctzll(word); // index of lowest 1-bit
+		            w_[wi] = word & (word - 1);                          // clear that bit
+		            return int((wi << 6) + tz);
+		        }
+		    }
+		    return -1; // unreachable if precondition holds
+		}
 
         // ---- popcount ----
         inline size_t count() const {
@@ -65,21 +82,34 @@ public:
         	std::swap(one.w_, other.w_);
 		};
 
+
         // ===== In-place set algebra (private) =====
         // All assume same shape (true by construction).
+        inline void ineg ()  {
+			for (size_t i = 0, n = w_.size(); i < n; ++i) w_[i] = ~w_[i];
+		    if (!w_.empty()) {
+		        const size_t rem = nbits_ & 63;
+		        if (rem) {
+		            const Bitmap::word_t mask = (Bitmap::word_t(1) << rem) - 1;
+		            w_.back() &= mask;
+		        }
+		    }
+		 }
         inline void ior (const Bitmap& b)  { for (size_t i = 0, n = w_.size(); i < n; ++i) w_[i] |=  b.w_[i]; }
         inline void iand(const Bitmap& b)  { for (size_t i = 0, n = w_.size(); i < n; ++i) w_[i] &=  b.w_[i]; }
         inline void ixor(const Bitmap& b)  { for (size_t i = 0, n = w_.size(); i < n; ++i) w_[i] ^=  b.w_[i]; }
         inline void isub(const Bitmap& b)  { for (size_t i = 0, n = w_.size(); i < n; ++i) w_[i] &= ~b.w_[i]; }
         inline void iclear(const size_t u) { const size_t wu = u >> 6; const Bitmap::word_t umask = Bitmap::word_t(1) << ((size_t)u & 63); w_[wu] &= ~umask; }
         inline void iset(const size_t u) { const size_t wu = u >> 6; const Bitmap::word_t umask = Bitmap::word_t(1) << ((size_t)u & 63); w_[wu] |= umask; }
+		inline Bitmap complement() const { Bitmap out = *this; out.ineg(); return out; }
 
-        // ===== Iterator over set indices =====
+        // ===== Iterator over set indices, increasing order =====
         class const_iterator {
         public:
             using value_type = size_t;
             using difference_type = std::ptrdiff_t;
             using iterator_category = std::input_iterator_tag;
+
 
             const_iterator() = default;
             value_type operator*() const { return cur_; }
@@ -90,12 +120,14 @@ public:
             }
             bool operator!=(const const_iterator& o) const { return !(*this == o); }
 
+
         private:
             friend class Bitmap;
             const Bitmap* b_ = nullptr;
             size_t wi_ = 0;
             word_t rem_ = 0;
             size_t cur_ = 0;
+
 
             void init_(const Bitmap* b, bool end) {
                 b_ = b;
@@ -122,8 +154,10 @@ public:
             }
         };
 
+
         const_iterator begin() const { const_iterator it; it.init_(this, false); return it; }
         const_iterator end()   const { const_iterator it; it.init_(this, true ); return it; }
+
 
         // ---- materialize indices ----
         std::vector<uint32_t> to_vector() const {
@@ -133,15 +167,18 @@ public:
             return out;
         }
 
+
     private:
         friend class GraphCore; // GraphCore can construct and mutate internally
         size_t nbits_ = 0;
         std::vector<word_t> w_;
 
+
         // Construction restricted to GraphCore
         Bitmap(size_t nbits, size_t nwords) : nbits_(nbits), w_(nwords, 0) {}
         explicit Bitmap(size_t nbits)
         : nbits_(nbits), w_((nbits + kWordBits - 1) / kWordBits, 0) {}
+
 
         static Bitmap from_indices(size_t nbits, const uint32_t* idx, size_t len) {
             Bitmap bm(nbits);
@@ -158,9 +195,11 @@ public:
         }
     };
 
+
 private:
     // Immutable edge sign pattern (±1 ints)
     std::vector<int>    sigma_;
+
 
     static Bitmap make_bitmap_from_indices(size_t nbits, const uint32_t* idx, size_t len) {
         return Bitmap::from_indices(nbits, idx, len);
@@ -169,6 +208,7 @@ private:
         return Bitmap::from_words(nbits, std::move(words));
     }
     static Bitmap make_empty_bitmap(size_t nbits) { return Bitmap(nbits); }
+
 
     // helpers to build N_pos_/N_neg_
     inline void init_empty_bitmaps_(int n) {
@@ -198,13 +238,17 @@ private:
         }
     }
 
+
 protected:
     const std::shared_ptr<igraph_t> g_;   // shared topology
     std::vector<Bitmap> N_pos_;   // + neighbors
     std::vector<Bitmap> N_neg_;   // - neighbors
     // Aggregations (by sign counts)
-    std::vector<double>             d_pos;
-    std::vector<double>             d_neg;
+    std::vector<int>    d_pos;
+    std::vector<int>    d_neg;
+    int    				m_pos;
+    int    				m_neg;
+
 
     using MapType = std::unordered_map<Edge, int, EdgeHash>;
     MapType _edge_index;
@@ -226,18 +270,26 @@ protected:
     inline bool is_neg_(const double w) const {
         return (w < 0.0) || (w == 0.0 &&  std::signbit(w));
     }
-    inline virtual int sign_of(int u, int v, int eid) const {
+    inline virtual int sign_of(const int u, const int v, int eid) const {
         return sigma_[(int)eid];
     }
 
     inline void compute_degrees() {
         const int n = vertex_count();
         d_pos.resize(n); d_neg.resize(n);
+        m_pos = 0; m_neg = 0;
         for (int u = 0; u < n; ++u) {
             d_pos[u] = static_cast<double>(neighbors_bm((size_t)u, +1).count());
             d_neg[u] = static_cast<double>(neighbors_bm((size_t)u, -1).count());
+            m_pos += d_pos[u];
+            m_neg += d_neg[u];
         }
+        m_pos >>= 1;
+        m_neg >>= 1;
     }
+
+	void on_vertex_flip_(int u);
+	virtual void on_neg_flip_batch_(const GraphCore::Bitmap& anchor);
 
 public:
     // Hook for salience used by views; base returns 0.0.
@@ -312,22 +364,36 @@ public:
     inline int edge_count()   const { return igraph_ecount(g_.get()); }
 
     inline const EdgeIndexesView edge_index() const { return EdgeIndexesView{_edge_index, g_.get()}; }
+    inline const int edge_index(int u, int v) const { return _edge_index.at(Edge{u,v}); }
     inline SignedEdgesView signs_view() const { return SignedEdgesView(this, g_.get()); }
     inline NegativeEdgesView negative_edges_view() const { return NegativeEdgesView(this, g_.get()); }
 
     // Degrees
-    inline const std::vector<double>& get_pos_degrees() const { return d_pos; }
-    inline const std::vector<double>& get_neg_degrees() const { return d_neg; }
-    inline double net_degree(int u) const noexcept { return d_pos[u] - d_neg[u]; }
+    inline int degree(int u, int sign) const { return (sign > 0) ? d_pos[u] : d_neg[u]; }
+    inline int net_degree(int u) const noexcept { return d_pos[u] - d_neg[u]; }
     inline std::vector<double> net_degrees() const { std::vector<double> d(vertex_count()); for (int u = 0; u < vertex_count(); ++u) d[u] = net_degree(u); return d; }
     inline long double max_pos_degree_vertex() const { int n = vertex_count(); long int mx=0, vid=0; for (int i=0;i<n;++i){ if (d_pos[i] > mx) { mx=d_pos[i]; vid=i; } } return vid; }
+
+    // antineighbors: not neighbors
+    inline const Bitmap antineighbors_bm(size_t u) const {
+        Bitmap out = neighbors_bm(u);
+        out.ineg();
+        out.iclear(u);
+        return out;
+    }
+    // common antineighborhoods
+	inline Bitmap common_antineighbors(size_t u, size_t v) const {
+	    Bitmap a = neighbors_bm(u);  // N(u) = N⁺(u) ∪ N⁻(u)
+	    a.ior(neighbors_bm(v));      // N(u) ∪ N(v)
+	    a.ineg();                    // complement: V \ (N(u) ∪ N(v))
+	    a.iclear(u); a.iclear(v);    // never include endpoints
+	    return a;
+	}
+    
     // sign>0 → positive neighbors; sign<0 → negative neighbors
+    // enumeration in increasing order of neighbors
     inline const Bitmap& neighbors_bm(size_t u, int sign) const {
         return (sign > 0) ? N_pos_[u] : N_neg_[u];
-    }
-    // anti = neighbors of the opposite sign (useful for P2 with sign flip)
-    inline const Bitmap& antineighbors_bm(size_t u, int sign) const {
-        return (sign > 0) ? N_neg_[u] : N_pos_[u];
     }
     // union (by value) for callers that want sign-agnostic neighborhood
     inline Bitmap neighbors_bm(size_t u) const {
@@ -335,6 +401,7 @@ public:
         out.ior(N_neg_[u]);
         return out;
     }
+
 
     // materialized neighbors (sign-agnostic) via bitmap fast path
     inline std::vector<int> neighbors(int u) const {
@@ -344,72 +411,30 @@ public:
     }
 
     // common positive neighbors: N⁺(u) ∩ N⁺(v)
-    inline Bitmap common_pos_neighbors(size_t u, size_t v) const {
-        Bitmap a = N_pos_[u];
-        Bitmap b = N_pos_[v];
-        a.iand(b);
-        return a;
-    }
-
-    // common negative neighbors: N⁻(u) ∩ N⁻(v)
-    inline Bitmap common_neg_neighbors(size_t u, size_t v) const {
-        Bitmap a = N_neg_[u];
-        Bitmap b = N_neg_[v];
-        a.iand(b);
+    inline Bitmap common_neighbors(size_t u, size_t v, int sign) const {
+        if (sign > 0) {
+			Bitmap a = N_pos_[u];
+	        a.iand(N_pos_[v]);
+	        return a;
+		}
+		Bitmap a = N_neg_[u];
+    	a.iand(N_neg_[v]);			
         return a;
     }
 
     // common positive neighbors: N⁺(u) ∩ N⁺(v)
-    inline Bitmap common_pos_neighbors(Edge e) const {
-		return common_pos_neighbors((size_t)e.first, (size_t)e.second);
-    }
-
-    // common negative neighbors: N⁻(u) ∩ N⁻(v)
-    inline Bitmap common_neg_neighbors(Edge e) const {
-		return common_neg_neighbors((size_t)e.first, (size_t)e.second);
+    inline Bitmap common_neighbors(Edge e, int sign) const {
+		return common_neighbors((size_t)e.first, (size_t)e.second, sign);
     }
 
     // common neighbors (sign-agnostic): (N⁺(u)∪N⁻(u)) ∩ (N⁺(v)∪N⁻(v))
     inline Bitmap common_neighbors(size_t u, size_t v) const {
-        Bitmap a = N_pos_[u]; a.ior(N_neg_[u]);
-        Bitmap b = N_pos_[v]; b.ior(N_neg_[v]);
-        a.iand(b);
+        Bitmap a = neighbors_bm(u);
+        a.iand(neighbors_bm(v));
         return a;
     }
-
-    // symmetric difference of positive neighborhoods
-    inline Bitmap common_pos_antineighbors(size_t u, size_t v) const {
-        Bitmap a = N_pos_[u];
-        Bitmap b = N_pos_[v];
-        a.ixor(b);
-        return a;
-    }
-
-    // symmetric difference of negative neighborhoods
-    inline Bitmap common_neg_antineighbors(size_t u, size_t v) const {
-        Bitmap a = N_neg_[u];
-        Bitmap b = N_neg_[v];
-        a.ixor(b);
-        return a;
-    }
-
-    // symmetric difference of positive neighborhoods
-    inline Bitmap common_pos_antineighbors(Edge e) const {
-		return common_pos_antineighbors((size_t)e.first, (size_t)e.second);
-    }
-
-    // symmetric difference of negative neighborhoods
-    inline Bitmap common_neg_antineighbors(Edge e) const {
-		return common_neg_antineighbors((size_t)e.first, (size_t)e.second);
-    }
-
-    // symmetric difference of sign-agnostic neighborhoods
-    inline Bitmap common_antineighbors(size_t u, size_t v) const {
-        Bitmap a = N_pos_[u]; a.ior(N_neg_[u]);
-        Bitmap b = N_pos_[v]; b.ior(N_neg_[v]);
-        a.ixor(b);
-        return a;
-    }
+    
+    std::vector<GraphCore::Bitmap> connected_components(int sign) const;
     
 	inline std::vector<int> maximal_clique_strict_pos(const std::vector<int>& order) const {
 	    if (order.empty()) return {};
@@ -457,13 +482,15 @@ public:
     inline virtual int sign_of(int eid) const {
         return sigma_[(int)eid];
     }
-    inline int sign_of(int u, int v) const {
-        igraph_integer_t eid; igraph_get_eid(g_.get(), &eid, u, v, 0, 0);
+    inline int sign_of(const int u, const int v) const {
+//        igraph_integer_t eid; igraph_get_eid(g_.get(), &eid, u, v, 0, 0);
+		int eid = _edge_index.at(Edge{u,v});
         return sign_of(u, v, eid);
     }
     inline int sign_of(const Edge& e) const {
         return sign_of(e.first, e.second);
     }
+
 
     // Sign tests (tie-break +0/-0 preserved via double cast)
     inline bool is_pos_edge(int eid) const {
@@ -478,16 +505,31 @@ public:
     inline bool is_neg_edge(int u, int v) const {
         return neighbors_bm((size_t)u, -1).contains((size_t)v);
     }
-	inline int negative_edge_count() const { long long sum = 0; for (double d : d_neg) sum += static_cast<long long>(d); return static_cast<int>(sum / 2); }
-    inline int positive_edge_count() const { long long sum = 0; for (double d : d_pos) sum += static_cast<long long>(d); return static_cast<int>(sum / 2); }
+	inline int edge_count(int sign) const { return (sign > 0) ? m_pos : m_neg; }
 	// --- enumerate only negative edges via bitmaps (v > u to avoid duplicates) ---
-	inline std::vector<Edge> get_negative_edges() const { std::vector<Edge> out; out.reserve(std::max(1, negative_edge_count())); const int n = vertex_count(); for (int u = 0; u < n; ++u) { const auto& bm = N_neg_[static_cast<size_t>(u)]; for (size_t vs : bm) { int v = static_cast<int>(vs); if (v > u) out.emplace_back(u, v); }} return out; }
-	inline std::vector<int> get_negative_eids() const { std::vector<int> ids; ids.reserve(std::max(1, negative_edge_count())); const int n = vertex_count(); for (int u = 0; u < n; ++u) { const auto& bm = N_neg_[static_cast<size_t>(u)]; for (size_t vs : bm) { int v = static_cast<int>(vs); if (v > u) ids.push_back(_edge_index.at({u,v})); }} return ids; }
-	inline std::vector<Edge> get_positive_edges() const { std::vector<Edge> out; out.reserve(std::max(1, positive_edge_count())); const int n = vertex_count(); for (int u = 0; u < n; ++u) { const auto& bm = N_pos_[static_cast<size_t>(u)]; for (size_t vs : bm) { int v = static_cast<int>(vs); if (v > u) out.emplace_back(u, v); }} return out;}
-	inline std::vector<int> get_positive_eids() const { std::vector<int> ids; ids.reserve(std::max(1, positive_edge_count())); const int n = vertex_count(); for (int u = 0; u < n; ++u) { const auto& bm = N_pos_[static_cast<size_t>(u)]; for (size_t vs : bm) { int v = static_cast<int>(vs); if (v > u) ids.push_back(_edge_index.at({u,v})); }} return ids;}
+	inline std::vector<Edge> get_edges(int sign) const { std::vector<Edge> out; out.reserve(std::max(1, edge_count(sign))); const int n = vertex_count(); for (int u = 0; u < n; ++u) { const auto& bm = neighbors_bm(static_cast<size_t>(u), sign); for (size_t vs : bm) { int v = static_cast<int>(vs); if (v > u) out.emplace_back(u, v); }} return out; }
 
-    inline void print_info() const { std::cout << "Graph has " << vertex_count() << " vertices and " << edge_count() << std::endl; }
+	inline igraph_vector_int_t get_edge_eids(int sign) const {
+		igraph_vector_int_t ids; igraph_vector_int_init(&ids, static_cast<int>(std::max(1, edge_count(sign))));
+		const int n = vertex_count();
+		int v;
+		int i = 0;
+		for (int u = 0; u < n; ++u) {
+			const auto& bm = neighbors_bm(static_cast<size_t>(u), sign);
+			for (size_t vs : bm) {
+				v = static_cast<int>(vs);
+				if (v < u) {
+					VECTOR(ids)[i++] = _edge_index.at({u,v});
+				}
+				else break;
+			}
+		}
+		return ids; // caller owns and must destroy
+	}
+
+    inline void print_info() const { std::cout << "Graph has " << vertex_count() << " vertices and " << edge_count() << " edges." << std::endl; }
 };
+
 
 // Effective sign under (integer) switching s ∈ {−1,+1}^V:
 //  - sign_of(u,v,eid) overrides GraphCore and returns round_pm1( s[u]*sigma[eid]*s[v] ) ∈ {−1,+1}.
@@ -497,7 +539,6 @@ public:
 //       * updates degree buckets d_pos/d_neg and bitmap rows N_pos_/N_neg_ to the POST-switch state.
 //       * complexity O(deg(u)). No direct access to sigma_.
 class SignedGraph : public GraphCore {
-
 protected:
     // Guarded switching vector: all writes update N_pos_/N_neg_ bitmaps
     class SwitchingVector {
@@ -542,11 +583,15 @@ protected:
         inline static double clamp_(double x) {
             if (x < -1.0) return -1.0; if (x > 1.0) return 1.0; return x;
         }
-		inline void assign_(int u, double x, igraph_vector_int_t* incident = nullptr) {
-		    if (g_->is_neg_(vals_[u]) == g_->is_pos_(x)) {
-		    	g_->on_switch_sign_changed_(u, vals_[u], clamp_(x), incident);
-		    }
+		inline void assign_(int u, double x) {
+		    if (vals_[u] == clamp_(x)) return;
+	    	g_->on_vertex_flip_(u, vals_[u], clamp_(x));
 		    vals_[u] = clamp_(x);
+		}
+		inline void neg_flip_batch_(const GraphCore::Bitmap& anchor) {
+	    	g_->on_neg_flip_batch_(anchor);
+	    	for (int u : anchor)
+		    	vals_[u] = -vals_[u];
 		}
     };
 
@@ -568,19 +613,20 @@ protected:
 	    for (double& x : s) x = round_pm1_(x);
 	}
 
-    inline int sign_of(int u, int v, int eid) const override {
+    inline int sign_of(const int u, const int v, int eid) const override {
         return round_pm1_(s_[u] * GraphCore::sign_of(u, v, eid) * s_[v]);
     }
 
     std::vector<int> maximal_salience_clique_strict_pos(const std::vector<int>& Z0) const;
     bool has_fractional_switching(double eps = 1e-12) const;
     void single_switching(int u);
-    void single_switching(int u, igraph_vector_int_t* incident);
 	// Called when s[u] changes sign (from and to have opposite signs).
 	// snapshot before changing s[u]
 	// Updates degrees and (+/−) bitmaps; O(deg(u)).
-	virtual void on_switch_sign_changed_(int u, double from, double to,
-	                                     igraph_vector_int_t* incident);
+	virtual void on_vertex_flip_(int u, double from, double to);
+	inline void neg_flip_batch_(const GraphCore::Bitmap& anchor) {
+		s_.neg_flip_batch_(anchor); // C.3 helper
+	}
 
     // compose switching (acts on s_ only; clamp to [-1,1])
     template<class Vec>
@@ -592,7 +638,7 @@ protected:
                 s_[u] *= static_cast<double>(s[u]);
             }
         }
-	}    
+	}
 
 public:
     // enable copy/move semantics for efficient transfers
@@ -606,8 +652,11 @@ public:
 	
 	SignedGraph& operator=(SignedGraph&& o) = delete;
 
+
     using GraphCore::is_pos_edge;
     using GraphCore::is_neg_edge;
+    using GraphCore::sign_of;
+
 
     // === Override eid-based sign queries to reflect switching via bitmaps ===
     inline int sign_of(int eid) const override {
@@ -615,11 +664,14 @@ public:
         return sign_of(u, v, eid);
     }
 
+
     std::unique_ptr<SignedGraph> clone() const;
     virtual ~SignedGraph();
 
+
     int frustrated_edges() const;
     const std::vector<Edge> frustrated_edges_keys() const;
+
 
     inline double vertex_salience(int u) const noexcept { return 1.0 - std::fabs(s_.readonly()[u]); }
     inline double edge_salience(int u, int v) const noexcept override {
@@ -635,4 +687,5 @@ public:
     void save_partition_svg(const std::vector<int>& partition, const std::string& filename, bool custom_layout) const;
     
 };
+
 

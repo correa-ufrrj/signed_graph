@@ -55,9 +55,6 @@ void FrustrationModelXY::build() {
     const int n = graph.vertex_count();
     const int m = graph.edge_count();
 
-    const auto& d_plus  = graph.get_pos_degrees();
-    const auto& d_minus = graph.get_neg_degrees();
-
     // ================== Vars ==================
     for (int i = 0; i < n; ++i)
         x.add(IloBoolVar(env, ("x_" + std::to_string(i)).c_str()));
@@ -71,7 +68,7 @@ void FrustrationModelXY::build() {
     // ================== Objective ==================
     {
         IloExpr obj(env);
-        for (int i = 0; i < n; ++i) obj += (d_plus[i] - d_minus[i]) * x[i];
+        for (int i = 0; i < n; ++i) obj += graph.net_degree(i) * x[i];
         for (const auto& [e, sgn] : signs) obj += -2.0 * sgn * y[edge_index[e]];
         objective = IloMinimize(env, obj);
         model.add(objective);
@@ -99,8 +96,8 @@ void FrustrationModelXY::build() {
 	    int added = 0, eligible = 0;
 	
 	    for (int u = 0; u < n; ++u) {
-	        const int dpos = d_plus[u];
-	        const int dneg = d_minus[u];
+	        const int dpos = graph.degree(u, +1);
+	        const int dneg = graph.degree(u, -1);
 	        const int dsig = dpos - dneg;                      // d_u(σ)
 	        const int rhs  = (int)std::floor(0.5 * (double)dsig); // ⌊d_u(σ)/2⌋
 	
@@ -134,7 +131,7 @@ void FrustrationModelXY::build() {
 	    // dsig[u] = d^+_σ(u) - d^-_σ(u)
 	    std::vector<int> dsig(n);
 	    for (int u = 0; u < n; ++u)
-	        dsig[u] = static_cast<int>(d_plus[u] - d_minus[u]);
+	        dsig[u] = static_cast<int>(graph.net_degree(u));
 	
 	    // Lightweight adjacency & sign lookups
 	    std::vector<int> sgn_of_eid(m, 0);                 // σ(eid) ∈ {±1}
@@ -321,7 +318,7 @@ void FrustrationModelXY::build() {
             vars.add(y[idx]); vals.add(yprod);
 		}
 
-        for (int i = 0; i < n; ++i) cplex.setPriority(x[i], d_plus[i]); // + d_minus[i]);
+        for (int i = 0; i < n; ++i) cplex.setPriority(x[i], graph.degree(i, +1)); // + d_minus[i]);
         cplex.addMIPStart(vars, vals);
         injected_heuristic_solutions++;
     }
@@ -487,32 +484,17 @@ FrustrationModelXY::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& al
 void FrustrationModelXY::TriangleCycleCutGenerator::main() {
     IloEnv ENV = getEnv();
     try {
-        // Callback-safe accessor (must not use model-side API in legacy callbacks)
+        // Base round-policy: if we already decided to stop separating, return.
+        if (!owner.cuts_enabled()) return;
+        const auto _t0 = std::chrono::steady_clock::now();
+
+        // Callback-safe accessor
         UserCutCallbackAccessor acc(*this);
 
-        // Snapshot LP and reseed switching from x̂ for coherence with heuristic callback
+        // Snapshot LP and reseed switching for coherence with heuristic callback
         owner.snapshot_lp_solution(acc);
         owner.graph.reseed_switching(owner.xhat);
-
-		const SignedGraphForMIP::GreedyKickOptions UB_OPTS = [&]{
-		    SignedGraphForMIP::GreedyKickOptions o;
-		    o.neg_edge_threshold_abs        = -1;
-		    o.neg_edge_threshold_frac       = 0.03;
-		    o.max_kicks                     = 3;
-		    o.use_weighted_degree           = true;
-		    o.use_triangle_tiebreak         = true;
-		    o.triangle_beta                 = 0.08;
-		    o.neighbor_cap                  = 1024;
-		    o.triangle_cap_per_u            = 1024;
-		    o.relax_to_all_pos_if_Z0_empty  = true;
-		    o.delta_m_minus_cap             = 512;
-		    o.delta_m_minus_penalty         = 0.0;
-		    o.R_max                         = 10;
-		    o.Delta                         = 1;
-		    return o;
-		}();
-
-		owner.graph.apply_greedy_switching(UB_OPTS);
+        owner.graph.apply_greedy_switching();
 
         // One driver round at the current LP solution
         auto R = owner.driver().run_round(owner.graph);
@@ -522,20 +504,16 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 
         int cuts_added = 0;
         struct CutTypeTally {
-		  int std_triangle = 0;
-		  int std_cycle    = 0;
-		  int rev_triangle = 0;
-		  int rev_cycle    = 0;
-		} g_cut_tally;
+            int std_triangle = 0;
+            int std_cycle    = 0;
+            int rev_triangle = 0;
+            int rev_cycle    = 0;
+        } g_cut_tally;
 
         // Process each accepted key once
         for (const auto& key : R.accepted_keys) {
-            // Build all ranges this cycle induces (could be >1 per cycle)
             std::vector<fmkey::CycleKey> singleton{key};
             auto cuts = owner.build_cycle_cuts_from_keys(ENV, singleton);
-
-            bool any_violated = false;
-            double max_viol = 0.0;
 
             // Evaluate each inequality at the current LP point
             for (auto& kv : cuts) {
@@ -546,24 +524,19 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
                 const double ub  = rng.getUB();
                 const double act = getValue(rng.getExpr());
 
-                // Generic violation amount (handles <=, >=, ==)
                 double viol_amt = 0.0;
                 if (lb != -IloInfinity) viol_amt = std::max(viol_amt, lb - act);
                 if (ub !=  IloInfinity) viol_amt = std::max(viol_amt, act - ub);
 
-                const bool violated = (viol_amt > VIOL_TOL);
-                if (violated) {
+                if (viol_amt > VIOL_TOL) {
                     add(rng).setName(lbl);
                     ++cuts_added;
-					if      (kv.second == "std-triangle") ++g_cut_tally.std_triangle;
-					else if (kv.second == "std-cycle")    ++g_cut_tally.std_cycle;
-					else if (kv.second == "rev-triangle") ++g_cut_tally.rev_triangle;
-					else if (kv.second == "rev-cycle")    ++g_cut_tally.rev_cycle;
-                    any_violated = true;
-                    if (viol_amt > max_viol) max_viol = viol_amt;
+                    if      (kv.second == "std-triangle") ++g_cut_tally.std_triangle;
+                    else if (kv.second == "std-cycle")    ++g_cut_tally.std_cycle;
+                    else if (kv.second == "rev-triangle") ++g_cut_tally.rev_triangle;
+                    else if (kv.second == "rev-cycle")    ++g_cut_tally.rev_cycle;
                 }
 
-                // Concert copies the range into the pool on add(); safe to end handle
                 rng.end();
             }
         }
@@ -573,12 +546,12 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
                   << " sp_cycles="  << R.cycles_accepted
                   << " cuts_added="  << cuts_added
                   << "\n";
-		std::cout << "[CALLBACK] cuts_by_type"
-		          << " std-triangle=" << g_cut_tally.std_triangle
-		          << " std-cycle="    << g_cut_tally.std_cycle
-		          << " rev-triangle=" << g_cut_tally.rev_triangle
-		          << " rev-cycle="    << g_cut_tally.rev_cycle
-		          << "\n";
+        std::cout << "[CALLBACK] cuts_by_type"
+                  << " std-triangle=" << g_cut_tally.std_triangle
+                  << " std-cycle="    << g_cut_tally.std_cycle
+                  << " rev-triangle=" << g_cut_tally.rev_triangle
+                  << " rev-cycle="    << g_cut_tally.rev_cycle
+                  << "\n";
 
         // Budget summary
         const int base_B  = owner.separation_config().budget.B_tri;
@@ -587,6 +560,30 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 
         std::cout << "[CALLBACK] budget_used(B_tri)=" << used_B
                   << "  anneal_next=" << next_B << "\n";
+
+        // ── Round-policy decision (minimal signals) ─────────────────────────
+        const auto _t1    = std::chrono::steady_clock::now();
+        const double dt_s = std::chrono::duration<double>(_t1 - _t0).count();
+
+        FrustrationModel::RoundStats rs{};         // CHANGED: now from base class
+        rs.rows_added   = cuts_added;
+        rs.cand_seen    = std::max(1, cuts_added); // conservative if unknown
+        rs.time_s       = dt_s;
+        rs.best_integer = getBestObjValue();       // incumbent (may be +inf if none)
+        rs.best_bound   = getObjValue();           // current LP relaxation bound
+        rs.tri_rows     = g_cut_tally.std_triangle + g_cut_tally.rev_triangle;
+        rs.cyc_rows     = g_cut_tally.std_cycle    + g_cut_tally.rev_cycle;
+        rs.std_rows     = g_cut_tally.std_triangle + g_cut_tally.std_cycle;
+        rs.rev_rows     = g_cut_tally.rev_triangle + g_cut_tally.rev_cycle;
+
+        double rel_gap = std::numeric_limits<double>::quiet_NaN();
+        try { rel_gap = getMIPRelativeGap(); } catch (...) {}
+
+        auto decision = owner.round_policy().decide(rel_gap, rs);
+        if (decision == FrustrationModel::RoundDecision::StopCutting) {
+            std::cout << "[ROUND-POLICY] stop_cutting=1 (hand control back to CPLEX)\n";
+            owner.disable_cuts();
+        }
     } catch (const IloCplex::Exception& e) {
         std::cout << "[CALLBACK] exception: " << e << "\n";
     }
@@ -614,26 +611,10 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
     const double zero_ratio = double(zero_nd) / double(owner.x.getSize());
     const int max_kicks = (is_root && zero_ratio >= 0.30) ? 3 : 1;
 
-    // 4) UB options
-    SignedGraphForMIP::GreedyKickOptions UB_OPTS;
-    UB_OPTS.neg_edge_threshold_abs  = -1;
-    UB_OPTS.neg_edge_threshold_frac = 0.03;
-    UB_OPTS.max_kicks               = max_kicks;
-    UB_OPTS.use_weighted_degree     = true;
-    UB_OPTS.use_triangle_tiebreak   = true;
-    UB_OPTS.triangle_beta           = (is_root ? 0.08 : 0.05);
-    UB_OPTS.neighbor_cap            = 1024;
-    UB_OPTS.triangle_cap_per_u      = 1024;
-    UB_OPTS.relax_to_all_pos_if_Z0_empty = true;
-    UB_OPTS.delta_m_minus_cap       = 512;
-    UB_OPTS.delta_m_minus_penalty   = 0.0;
-    UB_OPTS.R_max = 10; UB_OPTS.Delta = 0;
-
-    // 5) run greedy switching
-    SignedGraphForMIP sg = owner.graph.greedy_switching(UB_OPTS);
+    // 4) run greedy switching
+    SignedGraphForMIP sg = owner.graph.greedy_switching();
     sg.apply_integer_projection();
-    UB_OPTS.R_max = 0;
-    sg.apply_greedy_switching(UB_OPTS);
+    sg.apply_greedy_switching();
    	sg.align_switching(owner.sym_vstar, owner.sym_xfix);
 
     IloNumVarArray xy_vars(getEnv());
@@ -649,8 +630,8 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
         xy_vars.add(owner.y[idx]); xy_vals.add(yprod);
 	}
 
-	const auto neg = sg.negative_edge_count();
-	const auto projNeg = sg.integer_projection().negative_edge_count();
+	const auto neg = sg.edge_count(-1);
+	const auto projNeg = sg.integer_projection().edge_count(-1);
 	std::cout << "[HEURISTIC-SOL] num neg edges=" << neg
 	          << " projNeg=" << projNeg
 	          << " (should correlate with frustration)" << std::endl;
@@ -725,7 +706,7 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
     const auto obj_val = eval_objective_for_assignment(xy_vars, xy_vals);
     const double incumbent = hasIncumbent() ? getIncumbentObjValue() : IloInfinity;
 	
-	std::cout << "[HEURISTIC-SOL] num neg edges=" << sg.negative_edge_count()
+	std::cout << "[HEURISTIC-SOL] num neg edges=" << sg.edge_count(-1)
 			  << " obj_val=" << obj_val
 			  << " incumbent=" << incumbent
 			  << "\n";

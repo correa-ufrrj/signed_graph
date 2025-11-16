@@ -15,9 +15,6 @@ void FrustrationModelX::build() {
         x[i] = IloBoolVar(env, ("x_" + std::to_string(i)).c_str());
     z = IloNumVar(env, "z");
 
-    const auto& d_plus = graph.get_pos_degrees();
-    const auto& d_minus = graph.get_neg_degrees();
-
     IloExpr obj_expr(env);
     obj_expr += z;
 
@@ -35,7 +32,7 @@ void FrustrationModelX::build() {
         // Net degree inequalities
 //        if (use_cut_generator & NET_DEGREE_CUTS) {
 //            for (int u = 0; u < graph.vertex_count(); ++u) {
-//                int d_u = d_plus[u] - d_minus[u];
+//                int d_u = graph.net_degree(u);
 //                if(abs(d_u) % 2 == 0) continue;
 //                IloExpr constraint(env);
 //                constraint += d_u * x[u];
