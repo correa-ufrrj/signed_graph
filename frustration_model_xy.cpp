@@ -49,8 +49,8 @@ FrustrationModelXY::FrustrationModelXY(SignedGraphForMIP& g, int cut_flags)
     : FrustrationModel(g, cut_flags), x(env), y(env), xval(env) {}
 
 void FrustrationModelXY::build() {
-    using clock = std::chrono::steady_clock;
-    const auto T0 = clock::now();
+    DBG_PHASE_DECL(using clock = std::chrono::steady_clock;
+    			   const auto T0 = clock::now(););
 
     const int n = graph.vertex_count();
     const int m = graph.edge_count();
@@ -93,7 +93,7 @@ void FrustrationModelXY::build() {
 
 	// ===== Net-degree cuts (iff --netdeg) — exact spec =====
 	if (use_cut_generator & NET_DEGREE_CUTS) {
-	    int added = 0, eligible = 0;
+	    DBG_PHASE_DECL(int added = 0, eligible = 0;);
 	
 	    for (int u = 0; u < n; ++u) {
 	        const int dpos = graph.degree(u, +1);
@@ -103,7 +103,7 @@ void FrustrationModelXY::build() {
 	
 	        // Only add when not dominated: ⌊d_u(σ)/2⌋ < d_u^-(σ)
 	        if (rhs < dneg) {
-	            ++eligible;
+	            DBG_PHASE(++eligible;);
 	
 	            IloExpr E(env);
 	            E += (double)dsig * x[u];
@@ -120,13 +120,15 @@ void FrustrationModelXY::build() {
 	
 	            model.add(E <= (double)rhs);
 	            E.end();
-	            ++added;
+	            DBG_PHASE(++added;);
 	        }
 	    }
 	
-	    net_degree_cut_count += added;
-	    std::cout << "[INIT-NETDEG] eligible=" << eligible
-	              << " added=" << added << "\n";
+	    DBG_PHASE({
+			net_degree_cut_count += added;
+		    std::cout << "[INIT-NETDEG] eligible=" << eligible
+		              << " added=" << added << "\n";
+		});
 	              
 	    // dsig[u] = d^+_σ(u) - d^-_σ(u)
 	    std::vector<int> dsig(n);
@@ -147,8 +149,8 @@ void FrustrationModelXY::build() {
 	        inc_eids[e.second].push_back(eid);
 	    }
 	
-	    int added_edge_anchored = 0;
-	    int scanned_pos = 0;
+	    DBG_PHASE_DECL(int added_edge_anchored = 0;
+	    			   int scanned_pos = 0;);
 	
 	    // Anchor at positive edges only
 	    for (const auto& [e, sgn] : signs) {
@@ -161,7 +163,7 @@ void FrustrationModelXY::build() {
 	
 	        // Keep only edges with odd parity d'_u + d'_v
 	        if ( ((dpu + dpv) & 1) == 0 ) continue;
-	        ++scanned_pos;
+	        DBG_PHASE(++scanned_pos;);
 	
 	        // RHS = floor((d'_u + d'_v)/2)
 	        const int rhs = static_cast<int>(std::floor(0.5 * static_cast<double>(dpu + dpv)));
@@ -190,11 +192,11 @@ void FrustrationModelXY::build() {
 	
 	        model.add(EA <= static_cast<double>(rhs));
 	        EA.end();
-	        ++added_edge_anchored;
+	        DBG_PHASE(++added_edge_anchored;);
 	    }
 	
-	    std::cout << "[INIT-NETDEG-EDGE+ODD] scanned_pos=" << scanned_pos
-	              << " added=" << added_edge_anchored << "\n";
+	    DBG_PHASE(std::cout << "[INIT-NETDEG-EDGE+ODD] scanned_pos=" << scanned_pos
+	              			<< " added=" << added_edge_anchored << "\n";);
 
 	}
 
@@ -255,7 +257,7 @@ void FrustrationModelXY::build() {
 	    };
 	
 	    // Enumerate negative edges from the switched graph (no full scan needed)
-	    int tri_seed_added = 0, cyc_seed_added = 0, seen = 0;
+	    DBG_PHASE_DECL(int tri_seed_added = 0, cyc_seed_added = 0, seen = 0;);
 	    std::vector<int> par_v, par_e, order_nodes;
 	    order_nodes.reserve((size_t)N);
 	
@@ -290,16 +292,18 @@ void FrustrationModelXY::build() {
 	        auto cuts = generate_cycle_cuts(env, cycle_edges); // generic (works for triangles and longer cycles)
 	        for (auto& kv : cuts) model.add(kv.first);
 	
-	        const bool is_triangle = ((int)cycle_edges.size() == 3);
-	        if (is_triangle) tri_seed_added += (int)cuts.size();
-	        else             cyc_seed_added += (int)cuts.size();
-	
-	        ++seen;
+	        DBG_PHASE({
+				const bool is_triangle = ((int)cycle_edges.size() == 3);
+		        if (is_triangle) tri_seed_added += (int)cuts.size();
+		        else             cyc_seed_added += (int)cuts.size();
+		
+		        ++seen;
+		    });
 	    }
 	
-	    std::cout << "[INIT-SEED] triangles_added=" << tri_seed_added
-	              << " negcycles_added=" << cyc_seed_added
-	              << " scanned=" << seen << "\n";
+	    DBG_PHASE(std::cout << "[INIT-SEED] triangles_added=" << tri_seed_added
+	              			<< " negcycles_added=" << cyc_seed_added
+	              			<< " scanned=" << seen << "\n";);
 	}
 
     // =============== MIP start ===============
@@ -334,28 +338,30 @@ void FrustrationModelXY::build() {
     }
 
     // ============== Done ==============
-    std::cout << "[BUILD] n=" << n << " m=" << m << " done in "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - T0).count()
-              << " ms\n";
+    DBG_PHASE(std::cout << "[BUILD] n=" << n << " m=" << m << " done in "
+              			<< std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - T0).count()
+              			<< " ms\n";);
 }
 
 void FrustrationModelXY::solve() {
     // One-shot probe of the configured separation knobs (before callbacks)
-    const auto& CFG = sep_cfg_;
-    std::cout << "[SEP-CONFIG] B_tri=" << CFG.budget.B_tri
-              << ", alpha=" << CFG.ranking.alpha
-              << ", theta=" << CFG.ranking.theta
-              << ", lambda_hist=" << CFG.ranking.lambda_hist
-              << ", lambda_LP=" << CFG.ranking.lambda_LP
-              << ", omega_eps=" << CFG.weights.omega_eps
-              << ", omega_max=" << CFG.weights.omega_max
-              << "\n";
-    std::cout << "[SEP-CONFIG] anneal{tau,v0,gamma_min,gamma_max,B_min}="
-              << "{" << CFG.anneal_tri.tau
-              << "," << CFG.anneal_tri.v0
-              << "," << CFG.anneal_tri.gamma_min
-              << "," << CFG.anneal_tri.gamma_max
-              << "," << CFG.anneal_tri.B_min << "}" << "\n";
+    DBG_PIPE({
+		const auto& CFG = sep_cfg_;
+	    std::cout << "[SEP-CONFIG] B_tri=" << CFG.budget.B_tri
+	              << ", alpha=" << CFG.ranking.alpha
+	              << ", theta=" << CFG.ranking.theta
+	              << ", lambda_hist=" << CFG.ranking.lambda_hist
+	              << ", lambda_LP=" << CFG.ranking.lambda_LP
+	              << ", omega_eps=" << CFG.weights.omega_eps
+	              << ", omega_max=" << CFG.weights.omega_max
+	              << "\n";
+	    std::cout << "[SEP-CONFIG] anneal{tau,v0,gamma_min,gamma_max,B_min}="
+	              << "{" << CFG.anneal_tri.tau
+	              << "," << CFG.anneal_tri.v0
+	              << "," << CFG.anneal_tri.gamma_min
+	              << "," << CFG.anneal_tri.gamma_max
+	              << "," << CFG.anneal_tri.B_min << "}" << "\n";
+	});
 
     // Register full pipeline separation callback
     if (use_cut_generator & (NEGATIVE_CYCLE_CUTS | TRIANGLE_CUTS))
@@ -484,8 +490,44 @@ FrustrationModelXY::generate_cycle_cuts(IloEnv& env, const std::vector<Edge>& al
 void FrustrationModelXY::TriangleCycleCutGenerator::main() {
     IloEnv ENV = getEnv();
     try {
-        // Base round-policy: if we already decided to stop separating, return.
-        if (!owner.cuts_enabled()) return;
+        // Scope-aware gate:
+        // If the pipeline is currently disabled, decide whether to recover now.
+        // In AllNodes mode we recover ONLY after the node advances.
+        if (!owner.cuts_enabled()) {
+            const auto scope = owner.round_policy().config().pipeline_scope;
+            if (scope == FrustrationModel::RoundPolicyConfig::Scope::AllNodes) {
+                const long long cur_node = static_cast<long long>(getNnodes64());
+                if (cur_node > owner.last_disabled_node_id()) {
+                    // New node reached: re-enable only if current relative gap ≥ 0.5%.
+                    double rel_gap = std::numeric_limits<double>::quiet_NaN();
+                    try { rel_gap = getMIPRelativeGap(); } catch (...) {}
+                    if (!std::isfinite(rel_gap)) {
+                        try {
+                            const double best_integer = getBestObjValue();
+                            const double best_bound   = getObjValue();
+                            if (std::isfinite(best_integer)) {
+                                const double denom = std::max(1e-12, std::fabs(best_integer));
+                                rel_gap = std::max(0.0, (best_integer - best_bound) / denom);
+                            }
+                        } catch (...) {}
+                    }
+                    const bool gap_ok = (std::isfinite(rel_gap) && rel_gap >= owner.round_policy().config().gap_close_rel);
+                    if (gap_ok) {
+                        owner.round_policy().reset_node();
+                        owner.enable_cuts();
+                        DBG_ROUND(std::cout << "[ROUND-POLICY] re-enable at node " << cur_node
+                                  			<< " (rel_gap=" << std::fixed << std::setprecision(6) << rel_gap
+                                  			<< " ≥ 0.005)\n";);
+                    } else {
+                        DBG_ROUND(std::cout << "[ROUND-POLICY] keep disabled at node " << cur_node
+                                  			<< " (rel_gap=" << std::fixed << std::setprecision(6) << rel_gap
+                                  			<< " < 0.005)\n";);
+                    }
+                }
+            }
+            // In either scope, do no work in this invocation.
+            return;
+        }
         const auto _t0 = std::chrono::steady_clock::now();
 
         // Callback-safe accessor
@@ -530,11 +572,13 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 
                 if (viol_amt > VIOL_TOL) {
                     add(rng).setName(lbl);
-                    ++cuts_added;
-                    if      (kv.second == "std-triangle") ++g_cut_tally.std_triangle;
-                    else if (kv.second == "std-cycle")    ++g_cut_tally.std_cycle;
-                    else if (kv.second == "rev-triangle") ++g_cut_tally.rev_triangle;
-                    else if (kv.second == "rev-cycle")    ++g_cut_tally.rev_cycle;
+                    DBG_CB({
+						++cuts_added;
+	                    if      (kv.second == "std-triangle") ++g_cut_tally.std_triangle;
+	                    else if (kv.second == "std-cycle")    ++g_cut_tally.std_cycle;
+	                    else if (kv.second == "rev-triangle") ++g_cut_tally.rev_triangle;
+	                    else if (kv.second == "rev-cycle")    ++g_cut_tally.rev_cycle;
+	                });
                 }
 
                 rng.end();
@@ -542,24 +586,26 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
         }
 
         // Telemetry
-        std::cout << "[CALLBACK] tri_selected=" << R.triangles_accepted
-                  << " sp_cycles="  << R.cycles_accepted
-                  << " cuts_added="  << cuts_added
-                  << "\n";
-        std::cout << "[CALLBACK] cuts_by_type"
-                  << " std-triangle=" << g_cut_tally.std_triangle
-                  << " std-cycle="    << g_cut_tally.std_cycle
-                  << " rev-triangle=" << g_cut_tally.rev_triangle
-                  << " rev-cycle="    << g_cut_tally.rev_cycle
-                  << "\n";
+        DBG_CB({
+	        std::cout << "[CALLBACK] tri_selected=" << R.triangles_accepted
+	                  << " sp_cycles="  << R.cycles_accepted
+	                  << " cuts_added="  << cuts_added
+	                  << "\n";
+	        std::cout << "[CALLBACK] cuts_by_type"
+	                  << " std-triangle=" << g_cut_tally.std_triangle
+	                  << " std-cycle="    << g_cut_tally.std_cycle
+	                  << " rev-triangle=" << g_cut_tally.rev_triangle
+	                  << " rev-cycle="    << g_cut_tally.rev_cycle
+	                  << "\n";
+	    });
 
         // Budget summary
         const int base_B  = owner.separation_config().budget.B_tri;
         const int next_B  = owner.separation_state().B_tri_cur;
         const int used_B  = (next_B > 0 ? std::min(base_B, next_B) : base_B);
 
-        std::cout << "[CALLBACK] budget_used(B_tri)=" << used_B
-                  << "  anneal_next=" << next_B << "\n";
+        DBG_CB(std::cout << "[CALLBACK] budget_used(B_tri)=" << used_B
+               			 << "  anneal_next=" << next_B << "\n";);
 
         // ── Round-policy decision (minimal signals) ─────────────────────────
         const auto _t1    = std::chrono::steady_clock::now();
@@ -581,8 +627,22 @@ void FrustrationModelXY::TriangleCycleCutGenerator::main() {
 
         auto decision = owner.round_policy().decide(rel_gap, rs);
         if (decision == FrustrationModel::RoundDecision::StopCutting) {
-            std::cout << "[ROUND-POLICY] stop_cutting=1 (hand control back to CPLEX)\n";
-            owner.disable_cuts();
+            const auto scope = owner.round_policy().config().pipeline_scope;
+            DBG_ROUND(std::cout << "[ROUND-POLICY] stop_cutting=1 (hand control back to CPLEX"
+                      			<< (scope == FrustrationModel::RoundPolicyConfig::Scope::AllNodes
+                          			? ", scope=AllNodes"
+                          			: ", scope=RootOnly")
+                      			<< ")\n";);
+            if (scope == FrustrationModel::RoundPolicyConfig::Scope::RootOnly) {
+                // Legacy behavior: disable globally.
+                owner.disable_cuts();
+            } else {
+                // AllNodes: silence the rest of THIS node only.
+                // We flip the global flag but remember the node id; the top guard
+                // will re-enable ONLY after the solver moves to a new node.
+	            const long long cur_node = static_cast<long long>(getNnodes64());
+                owner.mark_disabled_at_node(cur_node);
+            }
         }
     } catch (const IloCplex::Exception& e) {
         std::cout << "[CALLBACK] exception: " << e << "\n";
@@ -720,7 +780,9 @@ void FrustrationModelXY::SwitchingHeuristicCallback::main() {
 }
 
 void FrustrationModelXY::configure_separation(const SeparationConfig& cfg) {
-	std::cout << "[CONFIGURE SEPARATION] use_triangles=" << cfg.modes.use_triangles << " use_negcyles=" << cfg.modes.use_negcycles << "\n";
+	const auto scope = round_policy().config().pipeline_scope;
+	std::cout << "[CONFIGURE SEPARATION] use_triangles=" << cfg.modes.use_triangles << " use_negcyles=" << cfg.modes.use_negcycles
+			  << " pipeline_scope=" << (scope == FrustrationModel::RoundPolicyConfig::Scope::RootOnly ? "RootOnly" : "AllNodes") << "\n";
     sep_cfg_ = cfg;
     driver_.reset();
 }
@@ -738,9 +800,6 @@ const TriangleCyclePipeline& FrustrationModelXY::driver() const {
 void FrustrationModelXY::ensure_driver_() {
     if (!driver_) {
         sep_state_.init_sizes_if_needed(graph);
-        // Sync EMA knobs into persistent (mirrors SeparationConfig)
-        sep_state_.ema_delta = sep_cfg_.ema.delta;
-        sep_state_.ema_kappa = sep_cfg_.ema.kappa;
         driver_ = std::make_unique<TriangleCyclePipeline>(sep_state_, sep_cfg_);
     }
 }

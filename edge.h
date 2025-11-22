@@ -1,6 +1,11 @@
 // edge.h
 #pragma once
 
+#define IGRAPH_ENABLE_LGPL
+#include <igraph/igraph.h>
+#include <igraph/igraph_vector.h>
+#include <igraph/igraph_attributes.h>
+
 #include <vector>
 #include <unordered_map>
 #include <iostream>
@@ -51,13 +56,32 @@ struct EdgePolarity {
 
 struct EdgeHash {
     size_t operator()(const Edge& edge) const {
-        int a = std::min(edge.first, edge.second);
-        int b = std::max(edge.first, edge.second);
-        return std::hash<int>()(a) ^ std::hash<int>()(b << 1);
+        return std::hash<int>()(edge.first) ^ std::hash<int>()(edge.second << 1);
     }
 };
 
+using EdgeMapType = std::unordered_map<Edge, int, EdgeHash>;
+
 std::ostream& operator<<(std::ostream& os, const SignedEdge& e);
+
+class EdgeIndexesView {
+private:
+    const igraph_t* g; const EdgeMapType& map;
+public:
+    explicit EdgeIndexesView(const EdgeMapType& m, const igraph_t* graph) : g(graph), map(m) {}
+    class const_iterator {
+    private: const igraph_t* g; igraph_integer_t eid; 
+    public:
+        using value_type = std::pair<Edge, int>;
+        const_iterator(const igraph_t* g, igraph_integer_t eid) : g(g), eid(eid) {}
+        value_type operator*() const { igraph_integer_t u,v; igraph_edge(g, eid, &u, &v); return {{(int)u,(int)v}, (int)eid}; }
+        const_iterator& operator++() { ++eid; return *this; }
+        bool operator!=(const const_iterator& other) const { return eid != other.eid; }
+    };
+    const_iterator begin() const { return const_iterator{g, 0}; }
+    const_iterator end()   const { return const_iterator{g, igraph_ecount(g)}; }
+    int operator[](const Edge& e) const { auto it = map.find(e); if (it == map.end()) throw std::out_of_range("Edge not found"); return it->second; }
+};
 
 class NegativeCycle {
 public:
@@ -69,6 +93,7 @@ public:
 private:
     Edge neg_edge_;
     std::vector<Edge> pos_edges_;
+    
 };
 
 // Inline definitions to satisfy linker

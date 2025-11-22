@@ -4,8 +4,21 @@
 #include <limits>
 #include <cstdio>
 #include <sstream>
-
 #include <iomanip>
+
+namespace {
+
+// --- Fast 64-bit hash for sign masks (no external deps) ---------------------
+// SplitMix64 mix (public-domain quality mix; good enough for probes)
+static inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    x = x ^ (x >> 31);
+    return x;
+}
+
+} // namespace
 
 std::ostream& operator<<(std::ostream& os, const Edge& e) {
     os << "(" << e.first << ", " << e.second << ")";
@@ -16,6 +29,17 @@ std::ostream& operator<<(std::ostream& os, const SignedEdge& e) {
     std::ostringstream tmp;
     os << e.points << ": " << e.sign << "]";
     return os;
+}
+
+std::shared_ptr<igraph_t> GraphCore::make_empty_graph_ptr_(int n) {
+    igraph_t* raw = new igraph_t;
+    if (igraph_empty(raw, n, /*directed=*/0) != IGRAPH_SUCCESS) {
+        delete raw;
+        throw std::runtime_error("igraph_empty failed");
+    }
+    return std::shared_ptr<igraph_t>(raw, [](igraph_t* p){
+        if (p) { igraph_destroy(p); delete p; }
+    });
 }
 
 // ===== GraphCore ctors =====
@@ -92,6 +116,127 @@ GraphCore::GraphCore(const std::string& file_path)
     compute_degrees();
 }
 
+GraphCore::GraphCore(int n, double p, uint64_t seed, bool /*fast_tag*/)
+    : g_(make_empty_graph_ptr_(n))
+{
+    if (n < 3) throw std::invalid_argument("n must be >= 3");
+    if (!(p >= 0.0 && p <= 1.0)) throw std::invalid_argument("p must be in [0,1]");
+
+    // (1) Sample activated triples via geometric gaps
+    const uint64_t M = choose3_(static_cast<uint64_t>(n));
+    std::mt19937_64 rng(seed);
+    std::geometric_distribution<uint64_t> geo(p/n);
+    std::bernoulli_distribution coin(0.5);
+
+    std::vector<uint64_t> idx;
+    idx.reserve(static_cast<size_t>(std::min<uint64_t>(M, 8 + static_cast<uint64_t>(M * p * 1.1))));
+    for (uint64_t i = 0; i < M; ) {
+        if (p == 0.0) break;
+        uint64_t gap = geo(rng);
+        if (i + gap >= M) break;
+        i += gap;
+        idx.push_back(i);
+        ++i;
+    }
+
+    // (2) Build sign map by completing only missing edges to keep odd negatives in each activated triple
+    std::unordered_map<Edge, int, EdgeHash> sign_map;
+    sign_map.reserve(static_cast<size_t>(n) * 6u);
+
+    auto get = [&](int a, int b)->int {
+        auto it = sign_map.find(Edge{a,b});
+        return it == sign_map.end() ? 0 : it->second; // 0=undef
+    };
+    auto set_if_undef = [&](int a, int b, int s){
+        Edge e{a,b};
+        if (sign_map.find(e) == sign_map.end())
+            sign_map.emplace(std::move(e), s); // never overwrite
+    };
+
+    int u, v, w;
+    for (uint64_t t : idx) {
+        index_to_triple_(static_cast<uint32_t>(n), t, u, v, w);
+
+        const int suv = get(u,v);
+        const int svw = get(v,w);
+        const int suw = get(u,w);
+
+        const int def = (suv != 0) + (svw != 0) + (suw != 0);
+        const int neg = (suv < 0) + (svw < 0) + (suw < 0);
+
+        if (def == 0) {
+            const int pick = std::uniform_int_distribution<int>(0,2)(rng);
+            set_if_undef(u,v, pick==0 ? -1 : +1);
+            set_if_undef(v,w, pick==1 ? -1 : +1);
+            set_if_undef(u,w, pick==2 ? -1 : +1);
+        } else if (def == 1) {
+            if (suv != 0) {
+                if (suv > 0) {
+                    if (coin(rng)) { set_if_undef(v,w, -1); set_if_undef(u,w, +1); }
+                    else           { set_if_undef(v,w, +1); set_if_undef(u,w, -1); }
+                } else {
+                    const int s = +1; // coin(rng) ? +1 : -1;
+                    set_if_undef(v,w, s);
+                    set_if_undef(u,w, s);
+                }
+            } else if (svw != 0) {
+                if (svw > 0) {
+                    if (coin(rng)) { set_if_undef(u,v, -1); set_if_undef(u,w, +1); }
+                    else           { set_if_undef(u,v, +1); set_if_undef(u,w, -1); }
+                } else {
+                    const int s = +1; // coin(rng) ? +1 : -1;
+                    set_if_undef(u,v, s);
+                    set_if_undef(u,w, s);
+                }
+            } else { // suw defined
+                if (suw > 0) {
+                    if (coin(rng)) { set_if_undef(u,v, -1); set_if_undef(v,w, +1); }
+                    else           { set_if_undef(u,v, +1); set_if_undef(v,w, -1); }
+                } else {
+                    const int s = +1; // coin(rng) ? +1 : -1;
+                    set_if_undef(u,v, s);
+                    set_if_undef(v,w, s);
+                }
+            }
+        } else { // def == 2
+            if (suv == 0)      set_if_undef(u,v, (neg % 2 == 0) ? -1 : +1);
+            else if (svw == 0) set_if_undef(v,w, (neg % 2 == 0) ? -1 : +1);
+            else               set_if_undef(u,w, (neg % 2 == 0) ? -1 : +1);
+        }
+        // def==3 cannot occur by construction here.
+    }
+
+    // (3) Materialize to igraph + sigma
+    std::vector<Edge> edges; edges.reserve(sign_map.size());
+    std::vector<double> sigma_d; sigma_d.reserve(sign_map.size());
+    for (const auto& kv : sign_map) { edges.push_back(kv.first); sigma_d.push_back(static_cast<double>(kv.second)); }
+
+    igraph_vector_int_t evec;
+    igraph_vector_int_init(&evec, static_cast<long>(2 * edges.size()));
+    for (size_t i = 0; i < edges.size(); ++i) {
+        VECTOR(evec)[2*i + 0] = static_cast<igraph_real_t>(edges[i].first);
+        VECTOR(evec)[2*i + 1] = static_cast<igraph_real_t>(edges[i].second);
+    }
+	if (igraph_add_edges(g_.get(), &evec, /*attr=*/nullptr) != IGRAPH_SUCCESS) {
+	    igraph_vector_int_destroy(&evec);
+	    throw std::runtime_error("igraph_add_edges failed");
+	}
+    igraph_vector_int_destroy(&evec);
+
+    // (4) Fill sigma_ (validated to ±1), index map, bitmaps, degrees
+    validate_and_fill_sigma(sigma_, sigma_d);
+
+    _edge_index.clear(); _edge_index.reserve(edges.size());
+    const igraph_integer_t m = igraph_ecount(g_.get());
+    for (igraph_integer_t eid = 0; eid < m; ++eid) {
+        igraph_integer_t a,b; igraph_edge(g_.get(), eid, &a, &b);
+        _edge_index.emplace(Edge{(int)a,(int)b}, (int)eid);
+    }
+
+    rebuild_bitmaps_from_sign_();
+    compute_degrees();
+}
+
 std::vector<GraphCore::Bitmap> GraphCore::connected_components(int sign) const {
     const int n = vertex_count();
 
@@ -131,62 +276,6 @@ std::vector<GraphCore::Bitmap> GraphCore::connected_components(int sign) const {
 
     return components;
 }
-
-// ===== SignedGraph ctors =====
-
-// Build from an existing igraph + new σ and a switching vector new_s.
-// GraphCore(base, new_sigma) builds bitmaps for raw σ → we must apply switching.
-SignedGraph::SignedGraph(const std::shared_ptr<igraph_t> base,
-                         std::vector<double> new_sigma,
-                         std::vector<double> new_s)
-    : GraphCore(base, std::move(new_sigma)),
-      s_(this)
-{
-    compose_switching_inplace(new_s);   // flips bitmaps/degree buckets to match new_s
-}
-
-// Pointer-copy from another SignedGraph.
-// GraphCore(other) copies already-switched bitmaps/degree buckets → do NOT flip again.
-SignedGraph::SignedGraph(const SignedGraph* const other)
-    : GraphCore(static_cast<const GraphCore* const>(other)),
-      s_(this)
-{
-    s_.vals_ = other->s_.readonly();    // silent copy; no structural updates
-}
-
-// Replace σ, keep other's switching.
-// GraphCore(other, new_sigma) is raw σ → we must apply other's s to rebuild effective signs.
-SignedGraph::SignedGraph(const SignedGraph* const other, std::vector<double> new_sigma)
-    : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
-      s_(this)
-{
-    compose_switching_inplace(other->s_.readonly());  // bring structure in sync with s_copy
-}
-
-// Load from file: σ-only; s_ defaults to +1, which already matches the structure.
-SignedGraph::SignedGraph(const std::string& file_path)
-    : GraphCore(file_path),
-      s_(this)
-{
-    // nothing else to do
-}
-
-// Replace σ and s explicitly.
-// GraphCore(other, new_sigma) is raw σ → apply new_s to structure.
-SignedGraph::SignedGraph(const SignedGraph* const other,
-                         std::vector<double> new_sigma,
-                         std::vector<double> new_s)
-    : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
-      s_(this)
-{
-    compose_switching_inplace(new_s);
-}
-
-std::unique_ptr<SignedGraph> SignedGraph::clone() const {
-    return std::make_unique<SignedGraph>(*this);
-}
-
-SignedGraph::~SignedGraph() {}
 
 void GraphCore::on_neg_flip_batch_(const GraphCore::Bitmap& anchor) {
     // C̄ = V \ A
@@ -255,6 +344,116 @@ void GraphCore::on_vertex_flip_(int u)
     std::swap(d_pos[u], d_neg[u]);
     Bitmap::swap(N_pos_[(size_t)u], N_neg_[(size_t)u]);
 }
+
+// ===== SignedGraph ctors =====
+
+// Build from an existing igraph + new σ and a switching vector new_s.
+// GraphCore(base, new_sigma) builds bitmaps for raw σ → we must apply switching.
+SignedGraph::SignedGraph(const std::shared_ptr<igraph_t> base,
+                         std::vector<double> new_sigma,
+                         std::vector<double> new_s)
+    : GraphCore(base, std::move(new_sigma)),
+      s_(this)
+{
+    compose_switching_inplace(new_s);   // flips bitmaps/degree buckets to match new_s
+}
+
+// Pointer-copy from another SignedGraph.
+// GraphCore(other) copies already-switched bitmaps/degree buckets → do NOT flip again.
+SignedGraph::SignedGraph(const SignedGraph* const other)
+    : GraphCore(static_cast<const GraphCore* const>(other)),
+      s_(this)
+{
+    s_.vals_ = other->s_.readonly();    // silent copy; no structural updates
+}
+
+// Replace σ, keep other's switching.
+// GraphCore(other, new_sigma) is raw σ → we must apply other's s to rebuild effective signs.
+SignedGraph::SignedGraph(const SignedGraph* const other, std::vector<double> new_sigma)
+    : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
+      s_(this)
+{
+    compose_switching_inplace(other->s_.readonly());  // bring structure in sync with s_copy
+}
+
+// Load from file: σ-only; s_ defaults to +1, which already matches the structure.
+SignedGraph::SignedGraph(const std::string& file_path)
+    : GraphCore(file_path),
+      s_(this)
+{
+    // nothing else to do
+}
+
+// Replace σ and s explicitly.
+// GraphCore(other, new_sigma) is raw σ → apply new_s to structure.
+SignedGraph::SignedGraph(const SignedGraph* const other,
+                         std::vector<double> new_sigma,
+                         std::vector<double> new_s)
+    : GraphCore(static_cast<const GraphCore* const>(other), std::move(new_sigma)),
+      s_(this)
+{
+    compose_switching_inplace(new_s);
+}
+
+SignedGraph::SignedGraph(int n, double p, uint64_t seed)
+    : GraphCore(n, p, seed, /*fast_tag*/true)
+    , s_(this, /*init_val=*/1.0)  // s ≡ +1; no bitmap flips necessary
+{
+    // WHY: base ctor already built sigma_, bitmaps, degrees.
+    // s_ is initialized to +1 so effective signs equal base sigma_.
+}
+
+std::unique_ptr<SignedGraph>
+SignedGraph::make_random(int n, double p, uint64_t seed) {
+    return std::unique_ptr<SignedGraph>(new SignedGraph(n, p, seed));
+}
+
+std::unique_ptr<SignedGraph> SignedGraph::clone() const {
+    return std::make_unique<SignedGraph>(*this);
+}
+
+SignedGraph::~SignedGraph() {}
+
+// SignedGraph::hash_sign_mask — sign-only hash of s_ (SwitchingVector)
+uint64_t SignedGraph::hash_sign_mask() const {
+    const std::vector<double>& sv = s_.readonly();
+    const size_t n = sv.size();
+
+    // Seed with length to make empty/non-empty distinct.
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ static_cast<uint64_t>(n);
+
+    uint64_t word = 0;
+    int bit = 0;
+
+    // Pack 64 sign-bits per word: bit=1 iff round_pm1_(s[u]) < 0.
+    for (size_t i = 0; i < n; ++i) {
+        const bool is_neg = is_neg_(round_pm1_(sv[i]));
+        word |= (static_cast<uint64_t>(is_neg) << bit);
+        if (++bit == 64) {
+            h ^= splitmix64(word ^ static_cast<uint64_t>(i));
+            h = (h << 27) | (h >> (64 - 27));
+            h = h * 0x165667919E3779F9ULL + 0x9E3779B97F4A7C15ULL;
+            word = 0;
+            bit  = 0;
+        }
+    }
+
+    // Tail (if n % 64 != 0)
+    if (bit != 0) {
+        h ^= splitmix64(word ^ static_cast<uint64_t>(n));
+        h = (h << 27) | (h >> (64 - 27));
+        h = h * 0x165667919E3779F9ULL + 0x9E3779B97F4A7C15ULL;
+    }
+
+    // Murmur3-style finalizer
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= (h >> 33);
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= (h >> 33);
+    return h;
+}
+
 
 // snapshot before changing s[u]
 void SignedGraph::on_vertex_flip_(int u, double from, double to)

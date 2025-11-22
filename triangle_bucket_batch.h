@@ -13,6 +13,7 @@
 #include <utility>
 #include <edge.h>
 #include <signed_graph.h>
+#include "fm_debug.h"
 
 // Design:
 //  - Iterate negative edges (anchors) under the *current switched signs*
@@ -65,20 +66,18 @@ public:
     struct Candidate {
         // Triangle (u,w,v) with anchor negative edge (u,v)
         VertexId u{}, w{}, v{};
+		bool	 all_neg{false};
         EdgeId   neg_eid{-1};       // y-index / internal id of (u,v)
         EdgeId   pos_eid_uw{-1};    // y-index / internal id of (u,w)
         EdgeId   pos_eid_wv{-1};    // y-index / internal id of (w,v)
         double   score_primary{0.0}; // caller-provided (e.g., 1/ω'+θ*sal)
         double   score_secondary{0.0}; // caller-provided (e.g., viol/|C|)
-        // Optional cached values the caller may want to keep:
-        double   viol{0.0};
-        double   phi{0.0};
     };
 
     // Simple adjacency for G^+_σ: pos_adj[u] = list of neighbors (v) with (u,v) \in E^+_σ
     // Edge index map: undirected (min(u,v), max(u,v)) -> EdgeId (e.g., y-index)
-    using PosAdj = std::vector<GraphCore::Bitmap>;
-    using EdgeIndex = std::unordered_map<long long, EdgeId>;
+    using CommonAdj = std::vector<GraphCore::Bitmap>;
+    using EdgeIndex = EdgeIndexesView;
 
     // Settings (caps/truncation)
     struct Params {
@@ -92,7 +91,7 @@ public:
 	// edge_index: map (min(u,v),max(u,v)) -> y-index / internal edge id
 	// params   : see Params
 	explicit TriangleBucketBatch(const std::vector<Edge>& neg_edges,
-	                                   const PosAdj& pos_adj,
+	                                   const CommonAdj& pos_adj,
 	                                   const EdgeIndex& edge_index,
 	                                   TriangleBucketBatch::Params params)
 	    : neg_edges_(neg_edges), pos_adj_(pos_adj), edge_index_(edge_index), P_(params) {
@@ -104,7 +103,7 @@ public:
 	
 	// Convenience overload: uses default Params{} (avoids default-arg inside class)
 	explicit TriangleBucketBatch(const std::vector<Edge>& neg_edges,
-	                                   const PosAdj& pos_adj,
+	                                   const CommonAdj& pos_adj,
 	                                   const EdgeIndex& edge_index)
 	    : TriangleBucketBatch(neg_edges, pos_adj, edge_index, Params{}) {}
 
@@ -146,14 +145,12 @@ public:
 
 private:
     // Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
-    static long long key_(VertexId a, VertexId b);
-    EdgeId eid_(VertexId a, VertexId b) const;
     bool respect_cap_(const Candidate& c, const std::vector<int>& used) const;
     bool already_taken_(const Candidate& c) const;
     void commit_(const Candidate& c, std::vector<int>& used);
 
     const std::vector<Edge>& neg_edges_;
-    const PosAdj& pos_adj_;
+    const CommonAdj& pos_adj_;
     const EdgeIndex& edge_index_;
     Params P_;
 
@@ -164,19 +161,20 @@ private:
     Stats stats_; // <- new lightweight stats holder
 };
 
-// --- Template implementation ---
 // 3) build_buckets: iterate set bits from the bitmap instead of merging two sorted vectors
 template <class Scorer>
-inline void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
+void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
     // ensure_sorted_adjacency_(); // ← delete/no-op
 
     const int A = (int)neg_edges_.size();
     for (int i = 0; i < A; ++i) {
-        const auto [u, v] = neg_edges_[i];
-        const EdgeId neg_eid = eid_(u, v);
+		const auto e = neg_edges_[i];
+        const auto [u, v] = e;
+        const EdgeId neg_eid = edge_index_[e];
         if (neg_eid < 0) continue;
 
         auto& buck = buckets_[neg_eid];
+		std::vector<Candidate> b_neg;
 
         // W = N⁺(u) ∩ N⁺(v), precomputed by caller as a bitmap
         const auto& Wbm = pos_adj_[i];
@@ -186,23 +184,37 @@ inline void TriangleBucketBatch::build_buckets(Scorer&& scorer) {
             Candidate c;
             c.u = u; c.v = v; c.w = w;
             c.neg_eid    = neg_eid;
-            c.pos_eid_uw = eid_(u, w);
-            c.pos_eid_wv = eid_(w, v);
+            c.pos_eid_uw = edge_index_[{u, w}];
+            c.pos_eid_wv = edge_index_[{w, v}];
             if (c.pos_eid_uw < 0 || c.pos_eid_wv < 0) continue;
 
             scorer(c);
-            buck.push_back(std::move(c));
+			if (c.all_neg) {
+				if (c.score_primary > 0.8) b_neg.push_back(std::move(c));
+			} else {
+            	buck.push_back(std::move(c));
+			}
         }
 
-        std::sort(buck.begin(), buck.end(),
-                  [](const Candidate& a, const Candidate& b){
-                      if (a.score_primary != b.score_primary) return a.score_primary > b.score_primary;
-                      return a.score_secondary > b.score_secondary;
-                  });
-        if (P_.K_tri_per_neg > 0 && (int)buck.size() > P_.K_tri_per_neg) {
-            buck.resize(P_.K_tri_per_neg);
-        }
-    }
+	    // ---- select top-K by (score_primary, score_secondary) ----
+	    auto cmp = [](const Candidate& a, const Candidate& b){
+	        if (a.score_primary != b.score_primary) return a.score_primary > b.score_primary;
+	        return a.score_secondary > b.score_secondary;
+	    };
+	
+	    const int K = P_.K_tri_per_neg;
+	    if (K > 0 && (int)buck.size() > K) {
+	        // Faster than full sort when K << N
+	        std::partial_sort(buck.begin(), buck.begin() + K, buck.end(), cmp);
+	        buck.resize(K);
+	    }
+	
+	    // ---- concatenate b_neg into buck (move, no copies) ----
+	    buck.reserve(buck.size() + b_neg.size());
+	    buck.insert(buck.end(),
+	                std::make_move_iterator(b_neg.begin()),
+	                std::make_move_iterator(b_neg.end()));
+	}
 
     // stats
     int nonempty = 0; long long total = 0;

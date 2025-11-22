@@ -10,9 +10,9 @@ struct SeparationConfig {
     // ---------------------- Ranking & LP guidance ----------------------
     struct Ranking {
         double alpha       = 1.2;   // triangle primary score weight (1/ω′)
-        double theta       = 0.08;  // triangle salience blend
+        double theta       = 0.5;  // triangle salience blend
         double lambda_hist = 0.4;  // historical repulsion blend (H)
-        double lambda_LP   = 0.5;  // LP salience blend (step 7+)
+        double lambda_LP   = 0.45;  // LP salience blend (step 7+)
         double viol_tol    = 1e-6;
         double inv_power   = 1.0;
     } ranking;
@@ -20,7 +20,7 @@ struct SeparationConfig {
     // ------------------------- Weight dynamics -------------------------
     struct Weights {
         double beta_emit = 10;    // within-batch ω′ bump per emit (used_density-scaled)
-        double beta_sel  = 0.2;    // cross-batch ω  drift per accepted edge
+        double beta_sel  = 0.3;    // cross-batch ω  drift per accepted edge
         double omega_eps = 1e-6;    // lower clamp for ω, ω′
         double omega_max = 32.0;    // upper clamp for ω
     } weights;
@@ -49,9 +49,9 @@ struct SeparationConfig {
     // ---------------------- EMA (H) & recent TTL -----------------------
     struct EMA {
         double delta = 0.992;   // decay (0<delta<1)
-        double rho   = 0.3;   // accepted-weight
-        double kappa = 0.15;  // emitted-but-rejected weight
-        int    recent_ttl = 3; // stateless dedup TTL rounds
+        double rho   = 0.3;     // accepted-weight
+        double kappa = 0.15;    // emitted-but-rejected weight
+        int    recent_ttl = 3;  // stateless dedup TTL rounds
     } ema;
 
     // -------------------------- Modes / gating -------------------------

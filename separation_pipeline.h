@@ -1,6 +1,7 @@
 // separation_pipeline.h
 #pragma once
 
+#include "fm_debug.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,6 +14,9 @@
 #include "signed_graph_mip.h"      // SignedGraphForMIP
 #include "cycle_key.h"             // fmkey::CycleKey
 #include "separation_config.h"     // SeparationConfig + adapters
+#include "triangle_bucket_batch.h"
+#include "negative_cycle_batch.h"   // for SP stage
+#include "separation_pipeline_tls.h"
 
 // Extern hooks used by TriangleBucketBatch. We provide strong definitions
 // in separation_pipeline.cpp and declare them as friends inside the class so
@@ -41,10 +45,6 @@ struct SeparationPersistent {
     int    B_tri_cur        = 0;   // effective budget used by the next triangle stage
     double bar_v_triangle   = 0.0; // running mean/EMA of last-round triangle violation
 
-    // EMA parameters for H
-    double ema_delta  = 0.85;   // decay (0<delta<1)
-    double ema_kappa  = 0.005;  // emitted-but-rejected weight
-
     // Convenience: initialize sizes once when graph is known
     void init_sizes_if_needed(const SignedGraphForMIP& G) {
         const int m = G.edge_count();
@@ -58,9 +58,8 @@ struct SeparationRound {
     std::vector<double> selected_count_full;  // per-round density increments (∑ 1/|C| for edges in accepted cuts)
     std::vector<double> sal_full;             // salience over FULL edges (normalized [0,1])
 
-    // Edge-aligned arrays over POSITIVE subgraph only (size = |E⁺| for current switching)
-    std::vector<double> omega_prime_pos;      // working weights ω′ on E⁺
-    std::vector<double> used_in_batch_pos;    // within-batch density counters on E⁺
+    // Edge-aligned arrays over the FULL graph (size = |E|)
+    std::vector<double> used_in_batch_full;    // within-batch “used” counters on FULL eids
 
     // Bookkeeping (diagnostics only in step 1)
     int emitted_triangles = 0;
@@ -69,26 +68,7 @@ struct SeparationRound {
     void clear() {
         emitted_triangles = emitted_cycles = 0;
         selected_count_full.clear();
-        omega_prime_pos.clear();
-        used_in_batch_pos.clear();
-    }
-};
-
-// full: original graph; pos: positive edges induced subgraph
-struct RoundGraphView {
-    // maps
-    std::vector<int> full2pos;    // |E| → {0..m_pos-1} or -1 if not in E⁺
-    std::vector<int> pos2full;    // |E⁺| → full eid
-
-    // masks on FULL edge ids under current switching
-    std::vector<char> pos_mask;   // |E|, 1 if edge ∈ E⁺_{σ_s}, else 0
-    std::vector<char> neg_mask;   // |E|, 1 if edge ∈ E⁻_{σ_s}, else 0
-
-    int m_pos = 0;                // |E⁺| for fast access
-    void clear() {
-        full2pos.clear(); pos2full.clear();
-        pos_mask.clear(); neg_mask.clear();
-        m_pos = 0;
+        used_in_batch_full.clear();
     }
 };
 
@@ -117,27 +97,14 @@ public:
     SeparationRound&       round()       { return round_; }
 
 private:
-
-    // Lightweight record of an accepted triangle this round (decoupled from TBB types)
-    struct TriAcc {
-        int u = -1, v = -1, w = -1;      // vertices (u,w,v) with anchor (u,v)
-        int neg_eid = -1;                // full edge id of (u,v)
-        int pos_eid_uw = -1;             // full edge id of (u,w)
-        int pos_eid_wv = -1;             // full edge id of (w,v)
-        double score_primary = 0.0;
-        double score_secondary = 0.0;
-        double viol = 0.0;               // not used in step 3 (kept for step 5+)
-        double phi  = 0.0;               // avg salience over triangle edges
-    };
-
     // Hooks called by TBB free functions (declared friend at end of class)
     void on_emit_(int full_eid, double used_density);
     void on_accept_(int full_eid, double density);
     int  override_budget_(int base) const;
 
     // Storage of triangle stage outputs for this round
-    std::vector<TriAcc> tri_selected_;
-    std::vector<int>    covered_neg_eids_;   // anchors that received at least one candidate
+    std::vector<TriangleBucketBatch::Candidate> tri_selected_;
+    GraphCore::Bitmap uncovered_neg_eids_;  // bits set = NEG edges still uncovered
 
     // Per-round exported keys (triangles now; SP in later step). Cleared at run start.
     std::vector<fmkey::CycleKey> accepted_keys_;
@@ -152,18 +119,14 @@ private:
 
     // Per-round scratch
     SeparationRound          round_;
-
-    // Full↔pos mapping under *current* switching (rebuilt each round)
-    RoundGraphView Gt_;
-
-    // Precompute full↔pos id maps for current switching; called at round start
-    void rebuild_pos_maps(const SignedGraphForMIP& G_);
+    
+    // debug: keep a few FULL eids that were actually used/accepted this round
+	std::vector<int> dbg_sample_feids_;
 
     // === Step-2+ stubs (no-ops in step 1) ===
-    void build_omega_prime_pos_();
+    void seed_sp_weights_(const SignedGraphForMIP& G);
     void triangle_stage_(const SignedGraphForMIP& G_);
     void sp_stage_(const SignedGraphForMIP& G_);
     void commit_stage_(const SignedGraphForMIP& G_);
-    void resize_round_pos_arrays_(int m_pos);
     void resize_round_full_arrays_(int m_full);    
 };

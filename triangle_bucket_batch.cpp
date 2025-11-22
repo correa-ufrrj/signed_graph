@@ -14,12 +14,12 @@ const std::vector<TriangleBucketBatch::Candidate>&
 TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_neg_out) {
     selected_.clear();
     taken_.clear();
-    covered_neg_out.clear();
+    DBG_TBB(covered_neg_out.clear(););
 
     if (buckets_.empty() || P_.B_tri <= 0) return selected_;
 
     std::vector<int> used_per_vertex(pos_adj_.size(), 0);
-	int cap_blocked = 0; // telemetry only
+	DBG_TBB_DECL(int cap_blocked = 0;); // telemetry only
 
     // Round-robin over buckets in deterministic order
     std::vector<EdgeId> keys;
@@ -28,27 +28,29 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
     std::sort(keys.begin(), keys.end());
 
     // Spec: covered_neg_out lists all nonempty bucket keys (incl. reheat-seeded)
-    for (EdgeId key : keys) if (!buckets_[key].empty()) covered_neg_out.push_back(key);
+    DBG_TBB({ for (EdgeId key : keys) if (!buckets_[key].empty()) covered_neg_out.push_back(key); });
 
     // Annealed budget and within-batch density (positive edges only)
     int budget = TBB_budget_override(P_.B_tri);
     std::unordered_map<EdgeId, double> used_in_this_batch;
-    int budget_used = 0;  // <-- add this
+    int budget_used = 0;
 
     // Pass 1: one per bucket
     for (EdgeId key : keys) {
         auto& buck = buckets_[key];
         for (const auto& c : buck) {
-            if (!respect_cap_(c, used_per_vertex)) { ++cap_blocked; continue; }
+            if (!respect_cap_(c, used_per_vertex)) { DBG_TBB(++cap_blocked;); continue; }
             commit_(c, used_per_vertex);
             ++budget_used;  // <-- count a committed triangle
             TBB_on_accept(c.neg_eid,    1.0/3.0);
             TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
             TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
-            used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
-            used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
-            TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
-            TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
+			if (!c.all_neg) {
+	            used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
+	            used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
+	            TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
+	            TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
+			}
             break; // at most one in Pass 1
         }
         if ((int)selected_.size() >= budget) {
@@ -66,16 +68,18 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
             auto& buck = buckets_[key];
             for (const auto& c : buck) {
                 if (already_taken_(c)) continue;
-                if (!respect_cap_(c, used_per_vertex)) { ++cap_blocked; continue; }
+                if (!respect_cap_(c, used_per_vertex)) { DBG_TBB(++cap_blocked;); continue; }
                 commit_(c, used_per_vertex);
                 ++budget_used;  // <-- count a committed triangle
                 TBB_on_accept(c.neg_eid,    1.0/3.0);
                 TBB_on_accept(c.pos_eid_uw, 1.0/3.0);
                 TBB_on_accept(c.pos_eid_wv, 1.0/3.0);
-                used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
-                used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
-                TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
-                TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
+				if (!c.all_neg) {
+		            used_in_this_batch[c.pos_eid_uw] += 1.0/3.0;
+		            used_in_this_batch[c.pos_eid_wv] += 1.0/3.0;
+		            TBB_on_emit(c.pos_eid_uw, used_in_this_batch[c.pos_eid_uw]);
+		            TBB_on_emit(c.pos_eid_wv, used_in_this_batch[c.pos_eid_wv]);
+				}
                 progressed = true;
                 break;
             }
@@ -83,12 +87,14 @@ TriangleBucketBatch::select(std::vector<TriangleBucketBatch::EdgeId>& covered_ne
         }
     }
 
-    stats_.B_eff    = budget_used;                 // <-- replace ‘effective_budget_used’
+    stats_.B_eff    = budget_used;
     stats_.selected = (int)selected_.size();
-    if (cap_blocked > 0) {
-        std::cout << "[TBB-CAP] blocked_by_cap=" << cap_blocked
-                  << " cap_per_vertex=" << P_.cap_per_vertex << "\n";
-    }
+    DBG_TBB({
+      if (cap_blocked > 0) {
+          std::cout << "[TBB-CAP] blocked_by_cap=" << cap_blocked
+                    << " cap_per_vertex=" << P_.cap_per_vertex << "\n";
+      }
+    });
     return selected_;
 }
 
@@ -101,17 +107,6 @@ TriangleBucketBatch::buckets() const { return buckets_; }
 
 const TriangleBucketBatch::Params& TriangleBucketBatch::params() const { return P_; }
 TriangleBucketBatch::Params& TriangleBucketBatch::params() { return P_; }
-
-// Map (min(u,v),max(u,v)) to a 64-bit key for unordered_map
-long long TriangleBucketBatch::key_(VertexId a, VertexId b) {
-    if (a > b) std::swap(a, b);
-    return ( (static_cast<long long>(a) << 32) ^ static_cast<unsigned long long>(b) );
-}
-
-int TriangleBucketBatch::eid_(int a, int b) const {
-    auto it = edge_index_.find(key_(a,b));
-    return (it == edge_index_.end()) ? -1 : it->second;
-}
 
 bool TriangleBucketBatch::respect_cap_(const Candidate& c, const std::vector<int>& used) const {
     if (P_.cap_per_vertex <= 0) return true;

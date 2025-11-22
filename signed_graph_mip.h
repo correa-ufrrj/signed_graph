@@ -5,6 +5,7 @@
 #include <vector>
 #include <optional>
 #include <cassert>
+#include <utility>
 
 // Forward-declare the stream class
 class ShortestPathGraph;
@@ -30,6 +31,10 @@ private:
     // d̃⁺[u] = Σ_v max(0, p_uv), d̃⁻[u] = Σ_v max(0, -p_uv), p_uv = s[u]*σ_uv*s[v]
     std::vector<double> dtilde_pos_;
     std::vector<double> dtilde_neg_;
+    mutable std::unique_ptr<ShortestPathGraph> sp_graph_;
+
+	explicit SignedGraphForMIP(int n, double p, double q, uint64_t seed);
+	explicit SignedGraphForMIP(int n, double p, double q);
 
 	// Helper: compute x = (s + 1)/2
     inline double x_from_s_(double s) const { return (s + 1.0) / 2.0; }
@@ -119,6 +124,20 @@ public:
     // Replace sigma (±1) and xhat ∈ [0,1]^V; s = 2*xhat − 1
     SignedGraphForMIP(const SignedGraphForMIP* const other, std::vector<double> new_sigma,
                       const std::vector<double>& xhat);
+                      
+    SignedGraphForMIP(const SignedGraphForMIP&) = delete;
+    SignedGraphForMIP& operator=(const SignedGraphForMIP&) = delete;
+
+    // Movable: do NOT move the SP; recreate lazily on first use in the new owner
+    SignedGraphForMIP(SignedGraphForMIP&&) noexcept;
+    SignedGraphForMIP& operator=(SignedGraphForMIP&&) noexcept = delete;
+
+    // Convenience factory
+	static std::unique_ptr<SignedGraphForMIP>
+	make_random(int n, double p, double q, uint64_t seed);
+	static std::unique_ptr<SignedGraphForMIP>
+	make_random(int n, double p, double q);
+
     ~SignedGraphForMIP();
 
 	inline double pos_cum_polarity(int u) const { return dtilde_pos_[u]; }
@@ -142,7 +161,7 @@ public:
     // Compose switching (returns a NEW MIP graph)
     template<class Vec>
     SignedGraphForMIP compose_switching(const Vec& s) {
-        SignedGraphForMIP out(this);   // copy MIP directly (reuses g_, sigma_, s_)
+        SignedGraphForMIP out(this);      // copy MIP directly (reuses g_, sigma_, s_)
         out.compose_switching_inplace(s); // updates s_ and recomputes degrees
         return out;
     }
@@ -158,11 +177,9 @@ public:
     // Edge polarity helpers (read-only live view and eager snapshot)
     inline EdgePolarityView edge_polarities_view() const { return EdgePolarityView(this, g_.get()); }
     const std::vector<double> edge_polarities() const;
+    inline const double edge_polarity(int u, int v) const { return polarity_of(u,v); };
     
-    ShortestPathGraph shortest_path_graph() const;
-
-    // Stream factory
-    NegativeCycleBatch open_negative_cycle_stream() const;
+    ShortestPathGraph& shortest_path_graph() const;
 };
 
 class ShortestPathGraph final {
@@ -249,8 +266,6 @@ public:
         other.sp_nodes_init_ = false;
         return *this;
     }
-    // Rebuild internal POS graph + maps after a switching in the owner.
-    inline void notify_signs_changed() { build_graph_(); }
 
     // ===== Weights (endpoint-based) =====
     // NOTE: Per request, no guards: callers must ensure (u,v) is a POS edge.
@@ -258,11 +273,15 @@ public:
         // Map (u,v) → full_eid via owner's edge index
         const int full_eid = G_.edge_index(u, v);             // -1 if absent
 
+        // Pull the current working weight (Dijkstra weights vector)
+        return weight(full_eid);
+    }
+    inline double weight(const int full_eid) const {
         // Map full_eid → pos_eid; negative edges have -1
         const igraph_integer_t peid = full2pos_eid_[(size_t)full_eid];
 
         // Pull the current working weight (Dijkstra weights vector)
-        return weight(peid);
+        return weight_(peid);
     }
     inline void set_weight(int u, int v, double w) {
         const int fe = G_.edge_index(u, v);
@@ -270,13 +289,16 @@ public:
         set_weight(pe, w);
     }
     // Bump with clamps (eps, max_cap=0 → no cap)
-    inline void bump_weight(int u, int v, double delta) {
-        const int fe = G_.edge_index(u, v);
+    inline void bump_weight(int fe, double delta) {
         const int pe = full2pos_eid_[(size_t)fe];
         double w = weight(pe) + delta;
         if (w < w_eps) w = w_eps;
         if (w_cap > 0.0 && w > w_cap) w = w_cap;
         set_weight(pe, w);
+    }
+    inline void bump_weight(int u, int v, double delta) {
+        const int fe = G_.edge_index(u, v);
+		bump_weight(fe, delta);
     }
     // Bump with clamps (eps, max_cap=0 → no cap)
     inline void bump_weights(const Path& p, double delta) {
@@ -309,11 +331,19 @@ public:
         const auto& ns = p.nodes_;
         for (int i = 1; i < (int)ns.size(); ++i) f(ns[i-1], ns[i]);
     }
+	template<class F>
+	void for_each_edge(F&& f) const {
+	    for (const auto& e : G_.get_edges(+1)) f(e.first, e.second);
+	}
 
     // visit full-eids on a Path (mapping hidden; caller gets IDs only).
     template <class F>
     void for_each_eid(const Path& p, F&& f) const {
         for (int pe : p.pos_peids_) f(pos2full_eid_[(size_t)pe]);
+    }
+    template <class F>
+    void for_each_eid(F&& f) const {
+        for (int pe : pos2full_eid_) f(pe);
     }
 
     // visit full-eids on a Path (mapping hidden; caller gets IDs only).
@@ -323,6 +353,7 @@ public:
     }
 
 private:
+    friend class SignedGraphForMIP; // only the owner may trigger rebuilds
     const SignedGraphForMIP& G_;
 
     // POS-only graph + working weights
@@ -342,7 +373,7 @@ private:
     // to reuse in dijkstra (mutable: written in const dijkstra())
     mutable igraph_vector_int_t sp_nodes_;
 
-    inline double weight(const int peid) const {
+    inline double weight_(const int peid) const {
         // Pull the current working weight (Dijkstra weights vector)
         return (double)VECTOR(w_pos_)[peid];
     }
@@ -350,4 +381,7 @@ private:
         VECTOR(w_pos_)[peid] = w;
     }
     void build_graph_();
+    // Rebuild internal POS graph + maps after a switching in the owner.
+    inline void notify_signs_changed() { build_graph_(); }
+
 };

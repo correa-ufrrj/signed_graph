@@ -89,7 +89,7 @@ public:
 private:
     Params P_{};
     const SignedGraphForMIP& G_;
-    ShortestPathGraph SP;
+    ShortestPathGraph& SP;
     igraph_integer_t vcount_{0};
     igraph_integer_t ecount_{0};
 

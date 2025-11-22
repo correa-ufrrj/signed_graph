@@ -130,6 +130,47 @@ SignedGraphForMIP::SignedGraphForMIP(const SignedGraphForMIP* const other,
     recompute_polarity_degrees_();
 }
 
+// Move ctor: move core state, but leave SP null to be lazily rebuilt on first use.
+SignedGraphForMIP::SignedGraphForMIP(SignedGraphForMIP&& other) noexcept
+    : SignedGraph(std::move(other))
+    , dtilde_pos_(std::move(other.dtilde_pos_))
+    , dtilde_neg_(std::move(other.dtilde_neg_))
+    , sp_graph_(nullptr) // lazily created when shortest_path_graph() is first called
+{
+    // Nothing else: SP is owner-bound, so we do not transfer it.
+}
+
+SignedGraphForMIP::SignedGraphForMIP(int n, double p, double q, uint64_t seed)
+    : SignedGraph(n, p, seed)              // builds random topology; base sets s ≡ +1
+    , dtilde_pos_(vertex_count(), 0.0)
+    , dtilde_neg_(vertex_count(), 0.0)
+    , sp_graph_(nullptr)
+{
+    if (q < 0.0) q = 0.0; else if (q > 1.0) q = 1.0;
+
+    const int nV = vertex_count();
+    std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ULL);
+    std::bernoulli_distribution bern(q);
+
+    std::vector<double> xhat(nV);
+    for (int u = 0; u < nV; ++u) xhat[u] = bern(rng) ? 1.0 : 0.0;
+
+    reseed_switching(xhat);
+    recompute_polarity_degrees_();
+}
+
+SignedGraphForMIP::SignedGraphForMIP(int n, double p, double q)
+    : SignedGraphForMIP(n, p, q, std::random_device{}()) {}
+
+std::unique_ptr<SignedGraphForMIP>
+SignedGraphForMIP::make_random(int n, double p, double q, uint64_t seed) {
+    return std::unique_ptr<SignedGraphForMIP>(new SignedGraphForMIP(n, p, q, seed));
+}
+
+std::unique_ptr<SignedGraphForMIP>
+SignedGraphForMIP::make_random(int n, double p, double q) {
+    return std::unique_ptr<SignedGraphForMIP>(new SignedGraphForMIP(n, p, q));
+}
 SignedGraphForMIP::~SignedGraphForMIP() = default;
 
 size_t SignedGraphForMIP::count_crossing_neg_edges_(const GraphCore::Bitmap& anchor) const {
@@ -214,7 +255,7 @@ void SignedGraphForMIP::apply_integer_projection() {
 
 SignedGraphForMIP SignedGraphForMIP::integer_projection() const {
     // Round s_ to ±1 and keep sigma_ intact; effective signs become integral
-    SignedGraphForMIP out = *this;
+    SignedGraphForMIP out(this);  // use pointer-based copy-like ctor (copy-ctor is deleted)
     out.apply_integer_projection();
     return out;
 }
@@ -235,11 +276,9 @@ const std::vector<double> SignedGraphForMIP::edge_polarities() const {
 
 void SignedGraphForMIP::align_switching(int u, double xfix01) {
     const double xu = get_rounded_x(u);
-    std::cout << "[ALIGN] x[v*]=" << xu << " target=" << xfix01 << "\n";
     if (std::fabs(xu - xfix01) > 1e-9) {
         s_.flip_all_no_bitmaps();   // global flip keeps edge signs unchanged
     }
-    std::cout << "[ALIGNED] x[v*]=" << get_x(u) << " target=" << xfix01 << "\n";
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -252,6 +291,9 @@ void SignedGraphForMIP::reseed_switching(const std::vector<double>& xhat) {
 
     for (int u = 0; u < vertex_count(); ++u) {
         s_[(size_t)u] = 2.0 * xhat[(size_t)u] - 1.0;
+    }
+    if (sp_graph_) {
+        sp_graph_->notify_signs_changed(); // build POS graph & maps from the current switching
     }
 }
 // ─────────────────────────────────────────────────────────────
@@ -278,7 +320,7 @@ void SignedGraphForMIP::apply_greedy_switching()
     };
 
     bool advanced = true;
-    int r = 0;
+    DBG_GREEDY_DECL(int r = 0;);
 
     while (advanced) {
         advanced = false;
@@ -327,54 +369,55 @@ void SignedGraphForMIP::apply_greedy_switching()
         }
 
         // ─── Step B: boundary-descent clique over N⁺ (if Step A stalled) ─────
-        ++r;
+        DBG_GREEDY(++r;);
         // (B.1) Find best seed pair (u,w) with w∈N⁺(u) minimizing B({u,w})
         double best_pair_cost = -EPS; // std::numeric_limits<double>::infinity();
         int u0 = -1, w0 = -1;
 
         for (int u = 0; u < n; ++u) {
-            int scanned = 0;
             for (size_t vs : neighbors_bm((size_t)u, +1)) { // only strictly positive neighbors
                 int v = (int)vs;
                 const double cost = net_polarity(u) + net_polarity(v) - 2.0 * polarity_of(u, v);
                 if (cost < best_pair_cost) { best_pair_cost = cost; u0 = u; w0 = v;
-                    std::cout << "[GREEDY-B] pair=(" << u0 << "," << w0 << ")"
-                	  << " best_pair_cost=" << best_pair_cost
-		              << " |N⁺(u)∩N⁺(v)|=" << common_neighbors((size_t)u0, (size_t)w0, +1).count()
-		              << " |N⁻(u)∩N⁻(v)|=" << common_neighbors((size_t)u0, (size_t)w0, -1).count()
-		              << " |N(u)∩N(v)|=" << common_neighbors((size_t)u0, (size_t)w0).count()
-		              << "\n";
+                    DBG_GREEDY(std::cout << "[GREEDY-B] pair=(" << u0 << "," << w0 << ")"
+							             << " best_pair_cost=" << best_pair_cost
+							             << " |N⁺(u)∩N⁺(v)|=" << common_neighbors((size_t)u0, (size_t)w0, +1).count()
+							             << " |N⁻(u)∩N⁻(v)|=" << common_neighbors((size_t)u0, (size_t)w0, -1).count()
+							             << " |N(u)∩N(v)|=" << common_neighbors((size_t)u0, (size_t)w0).count()
+							             << "\n";);
 		        }
             }
         }
 
-		if (u0 >= 0) {
-		    const double du  = net_polarity(u0);
-		    const double dv  = net_polarity(w0);
-		    const double puv = polarity_of(u0, w0);                 // s[u0]*σ(u0,w0)*s[w0] ∈ [-1,1]
-		    const int degp_u = (int)neighbors_bm((size_t)u0, +1).count();
-		    const int degp_v = (int)neighbors_bm((size_t)w0, +1).count();
-		    auto W0 = common_neighbors((size_t)u0, (size_t)w0, +1);   // N⁺(u0) ∩ N⁺(w0)
-		    const size_t frontier0 = W0.count();
-		
-		    // B({u0,w0}) should equal du + dv − 2·puv (for sanity)
-		    std::cout << "[GREEDY-B] r=" << r
-		              << " pair=(" << u0 << "," << w0 << ")"
-		              << " B=" << (du + dv - 2.0 * puv)
-		              << " (du=" << du << ", dv=" << dv << ", 2*p_uv=" << (2.0 * puv) << ")"
-		              << " |N⁺(u)|=" << degp_u
-		              << " |N⁺(v)|=" << degp_v
-		              << " |N⁺(u)∩N⁺(v)|=" << frontier0
-		              << " cur_minus=" << cur_mminus
-		              << " best_minus=" << best_mminus
-		              << "\n";
-		} else {
-		    std::cout << "[GREEDY-B] r=" << r
-		              << " pair=<none>"
-		              << " cur_minus=" << cur_mminus
-		              << " best_minus=" << best_mminus
-		              << "\n";
-		}
+		DBG_GREEDY({
+			if (u0 >= 0) {
+			    const double du  = net_polarity(u0);
+			    const double dv  = net_polarity(w0);
+			    const double puv = polarity_of(u0, w0);                 // s[u0]*σ(u0,w0)*s[w0] ∈ [-1,1]
+			    const int degp_u = (int)neighbors_bm((size_t)u0, +1).count();
+			    const int degp_v = (int)neighbors_bm((size_t)w0, +1).count();
+			    auto W0 = common_neighbors((size_t)u0, (size_t)w0, +1);   // N⁺(u0) ∩ N⁺(w0)
+			    const size_t frontier0 = W0.count();
+			
+			    // B({u0,w0}) should equal du + dv − 2·puv (for sanity)
+			    std::cout << "[GREEDY-B] r=" << r
+			              << " pair=(" << u0 << "," << w0 << ")"
+			              << " B=" << (du + dv - 2.0 * puv)
+			              << " (du=" << du << ", dv=" << dv << ", 2*p_uv=" << (2.0 * puv) << ")"
+			              << " |N⁺(u)|=" << degp_u
+			              << " |N⁺(v)|=" << degp_v
+			              << " |N⁺(u)∩N⁺(v)|=" << frontier0
+			              << " cur_minus=" << cur_mminus
+			              << " best_minus=" << best_mminus
+			              << "\n";
+			} else {
+			    std::cout << "[GREEDY-B] r=" << r
+			              << " pair=<none>"
+			              << " cur_minus=" << cur_mminus
+			              << " best_minus=" << best_mminus
+			              << "\n";
+			}
+		});
 
         if (u0 >= 0 && best_pair_cost < -EPS) {
             std::vector<int> Q; Q.reserve(32); Q.push_back(u0); Q.push_back(w0);
@@ -410,7 +453,7 @@ void SignedGraphForMIP::apply_greedy_switching()
                 for (size_t x : W) acc[(int)x] += polarity_of(zstar, (int)x);
             }
 
-            std::cout << "[GREEDY-B] |Q|=" << Q.size() << "\n";
+            DBG_GREEDY(std::cout << "[GREEDY-B] |Q|=" << Q.size() << "\n";);
 
             if ((int)Q.size() >= 2) {
                 for (int v : Q) {
@@ -446,6 +489,15 @@ void SignedGraphForMIP::apply_greedy_switching()
 	                cur_mminus = edge_count(-1);
                     best_mminus = cur_mminus;
                     best_s = s_.readonly();
+		
+				    // B({u0,w0}) should equal du + dv − 2·puv (for sanity)
+				    DBG_GREEDY(std::cout << "[GREEDY-C] best_cross=" << best_cross
+						                 << " comps.size=" << comps.size()
+						                 << " comps best size=" << comps[best_i].count()
+						                 << " cur_minus=" << cur_mminus
+						                 << " best_minus=" << best_mminus
+						                 << "\n";);
+		
 		            continue; // Re-enter the while(advanced) loop
 		        }
 		    }
@@ -457,6 +509,9 @@ void SignedGraphForMIP::apply_greedy_switching()
     for (int u = 0; u < vertex_count(); ++u) {
         s_[u] = best_s[u];
     }
+    if (sp_graph_) {
+        sp_graph_->notify_signs_changed(); // build POS graph & maps from the current switching
+    }
 }
 
 SignedGraphForMIP SignedGraphForMIP::greedy_switching() const {
@@ -465,38 +520,11 @@ SignedGraphForMIP SignedGraphForMIP::greedy_switching() const {
     return sg;
 }
 
-    
-ShortestPathGraph SignedGraphForMIP::shortest_path_graph() const { return ShortestPathGraph(*this); }
-
-// ─────────────────────────────────────────────────────────────
-// Negative-cycle finder stream (unchanged API)
-// ─────────────────────────────────────────────────────────────
-
-NegativeCycleBatch SignedGraphForMIP::open_negative_cycle_stream() const {
-    return NegativeCycleBatch(*this);
+// Lazy accessor: create SP on first call, then keep reusing it.
+ShortestPathGraph& SignedGraphForMIP::shortest_path_graph() const {
+    if (!sp_graph_) {
+        sp_graph_ = std::make_unique<ShortestPathGraph>(*this);
+        sp_graph_->notify_signs_changed(); // build POS graph & maps from the current switching
+    }
+    return *sp_graph_;
 }
-
-//std::vector<NegativeCycle>
-//SignedGraphForMIP::find_switched_lower_bound(bool cover) {
-//    std::vector<NegativeCycle> out;
-//    auto stream = open_negative_cycle_stream(cover);
-//    std::vector<NegativeCycle> batch;
-//    while (stream.next(batch)) {
-//        out.insert(out.end(),
-//                   std::make_move_iterator(batch.begin()),
-//                   std::make_move_iterator(batch.end()));
-//    }
-//    return out;
-//}
-//
-//std::vector<std::vector<NegativeCycle>>
-//SignedGraphForMIP::find_switched_lower_bound_grouped(bool cover) const {
-//    std::vector<std::vector<NegativeCycle>> groups;
-//    auto stream = open_negative_cycle_stream(cover);
-//    std::vector<NegativeCycle> batch;
-//    while (stream.next(batch)) {
-//        groups.emplace_back();
-//        groups.back().swap(batch);
-//    }
-//    return groups;
-//}

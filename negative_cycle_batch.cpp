@@ -67,7 +67,7 @@ void NegativeCycleBatch::build_initial_state_() {
     ecount_ = G_.edge_count();
 
     base_pos_.assign((size_t)ecount_, 1.0);
-	SP.notify_signs_changed();
+//	SP.notify_signs_changed();
 
     tri_used_per_vertex_.assign((size_t)vcount_, 0);
     neg_edge_covered_.assign((size_t)ecount_, 0);
@@ -92,6 +92,7 @@ void NegativeCycleBatch::on_emit_(int full_eid, double used_density) {
     if ((size_t)used_in_batch_pos_.size() < (size_t)ecount_) used_in_batch_pos_.assign((size_t)ecount_, 0.0);
     if (full_eid >= 0 && full_eid < (int)used_in_batch_pos_.size()) {
         used_in_batch_pos_[(size_t)full_eid] += std::max(0.0, used_density);
+	    SP.bump_weight(full_eid, P_.beta_emit * used_density);
     }
 }
 
@@ -134,14 +135,15 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
     if (finished_) return false;
 
     using clock = std::chrono::steady_clock;
-    long long ms_dijkstra = 0, ms_check = 0, ms_emit = 0, ms_misc = 0;
-    size_t neg_edges_scanned = 0, cycles_emitted_now = 0;
-    size_t triangles_emitted_now = 0;  // kept for logging; will stay 0
-    long long path_nodes_scanned = 0, pos_edges_on_paths = 0;
+    DBG_SP_DECL(
+      long long ms_dijkstra = 0, ms_check = 0, ms_emit = 0, ms_misc = 0;
+      size_t neg_edges_scanned = 0, cycles_emitted_now = 0;
+      size_t triangles_emitted_now = 0;
+      long long path_nodes_scanned = 0, pos_edges_on_paths = 0;
+      const size_t before_total = total_found_;
+    );
 
     build_mask_for_batch_();
-
-    const size_t before_total = total_found_;
 
     // === NO triangle-first step here anymore ===
     // The uncovered set is exactly what we were given at construction.
@@ -176,7 +178,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
             return (k > 0) ? (sum_inv / (double)k) : 0.0; // = 1 / Hmean(ω′)
         };
         
-	    // --- Build buckets -------------------------------------------------
+	    // --- Build buckets in order of neg edges -------------------------------------------------
 	    for (const auto& e_neg : neg_edges_uncov) {
 	        const int uu = e_neg.first, vv = e_neg.second;
 	        const int neg_full_eid = (int)edge_idx[Edge{uu, vv}];
@@ -198,12 +200,14 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 				}
 				
                 // 3) Run Dijkstra (through SP)
-                const auto t0 = clock::now();
+                DBG_SP_DECL(const auto t0 = clock::now(););
                 auto p = SP.dijkstra(uu, vv);
-                ms_dijkstra += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
-                ++neg_edges_scanned;
+                DBG_SP({
+                  ms_dijkstra += std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+                  ++neg_edges_scanned;
+                });
                 if (!p.reachable() || p.length() < 2) {
-					std::cout << "\n-\n\n";
+					DBG_SP(std::cout << "-\n\n";);
 	                break;
 	            }
 	            const double len_now = p.cost();
@@ -257,25 +261,22 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	                if (tri_used_per_vertex_[(int)uu] < tri_cap_per_vertex_) ++tri_used_per_vertex_[(int)uu];
 	                if (tri_used_per_vertex_[(int)vv] < tri_cap_per_vertex_) ++tri_used_per_vertex_[(int)vv];
 	                if (tri_used_per_vertex_[(int)w ] < tri_cap_per_vertex_) ++tri_used_per_vertex_[(int)w];
-	                ++triangles_emitted_now;
+	                DBG_SP(++triangles_emitted_now;);
 	            }
 	        }
-	
-	        // Cross-batch drift along full edges (|C| = path length)
-	        SP.for_each_eid(c.path, [&](int feid){
-	            bump_cross_batch_(feid, c.path.length());
-	        });
-	
+
 	        // Within-batch density mask (selected)
 	        const double dens = 1.0 / std::max(1, c.path.length());
 	        SP.for_each_eid(c.path, [&](int feid){
+	            bump_cross_batch_(feid, c.path.length());
 	            used_in_batch_pos_[(size_t)feid] += dens;
 	        });
 	
 	        // Materialize the cycle
 	        const auto& se = sv[neg_full_eid];
 			out.emplace_back(Edge{(int)se.points.first,(int)se.points.second}, c.path.edges());
-	        ++total_found_; ++cycles_emitted_now;
+	        ++total_found_;
+	        DBG_SP(++cycles_emitted_now;);
 	
 	        // Mark coverage for this negative edge
 	        neg_edge_covered_[(size_t)neg_full_eid] = 1;
@@ -329,7 +330,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
 	++batches_emitted_;
     finished_ = true;
 
-    std::cout << "[TRI_CYC-PROFILE] negE_scanned=" << neg_edges_scanned
+    DBG_SP(std::cout << "[TRI_CYC-PROFILE] negE_scanned=" << neg_edges_scanned
     		  << ", K_sp_per_neg=" << P_.K_sp_per_neg
               << ", cycles_out=" << cycles_emitted_now
               << ", tri_out=" << triangles_emitted_now
@@ -341,7 +342,7 @@ bool NegativeCycleBatch::next(std::vector<NegativeCycle>& out) {
               << ", ms_misc=" << ms_misc
               << ", batches=" << batches_emitted_
               << ", batch_size=" << out.size()
-              << std::endl;
+              << std::endl;);
 
     return !out.empty();
 }
